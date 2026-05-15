@@ -391,6 +391,13 @@ def analyze(
     # Overall average latency across all ops (all op types combined)
     avg_latency_ms = round(float(df["latency_ms"].mean()), 3) if not df["latency_ms"].dropna().empty else None
 
+    # Top 5 busiest windows for the report table
+    top_windows = (
+        windows.nlargest(5, "req_count")
+        [["time_ms", "req_count", "p95_lat"]]
+        .to_dict("records")
+    )
+
     return {
         "windows":     windows,
         "df":          df,
