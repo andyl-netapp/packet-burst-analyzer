@@ -374,9 +374,10 @@ def analyze(
         }
 
     load_groups = {
-        "light":  _win_group(0,  10),   # quietest 10 %
-        "normal": _win_group(45, 55),   # middle 10 %
-        "heavy":  _win_group(90, 100),  # busiest 10 %
+        "q1": _win_group(0,   30),   # lightest 30%
+        "q2": _win_group(30,  60),   # 31–60%
+        "q3": _win_group(60,  90),   # 61–90%
+        "q4": _win_group(90, 100),   # busiest 10%
     }
 
     # ── Average READ / WRITE op size ──────────────────────────────────────────
@@ -452,7 +453,7 @@ def plot_analysis(result: dict, protocol: str, out_path: Path) -> None:
 
     min_t = df["timestamp"].min()   # relative-time anchor
 
-    fig = plt.figure(figsize=(16, 14))
+    fig = plt.figure(figsize=(16, 11))
     fig.suptitle(
         f"{protocol.upper()} Burstiness Analysis\n"
         f"Duration: {s['duration_sec']:.1f}s | "
@@ -463,7 +464,7 @@ def plot_analysis(result: dict, protocol: str, out_path: Path) -> None:
         fontsize=13, fontweight="bold",
     )
 
-    gs = gridspec.GridSpec(4, 2, figure=fig, hspace=0.55, wspace=0.35)
+    gs = gridspec.GridSpec(3, 2, figure=fig, hspace=0.55, wspace=0.35)
 
     # ── Panel 1: Request rate over time (full width) ───────────────────────────
     ax1 = fig.add_subplot(gs[0, :])
@@ -513,75 +514,63 @@ def plot_analysis(result: dict, protocol: str, out_path: Path) -> None:
     ax2.legend(loc="upper right", fontsize=9)
     ax2.grid(True, alpha=0.2)
 
-    # ── Panel 3: Per-window p50 + p95 lines (full width) ──────────────────────
-    # Shows the rolling percentile trend without noise of individual ops.
-    ax3 = fig.add_subplot(gs[2, :])
-    valid = windows.dropna(subset=["p50_lat"])
-    if not valid.empty:
-        t3 = valid["time_ms"] / 1000
-        ax3.plot(t3, valid["p50_lat"], color="steelblue", lw=1.2,
-                 marker=".", markersize=3, label="p50 per window")
-        ax3.plot(t3, valid["p95_lat"].fillna(np.nan), color="darkorange", lw=1.2,
-                 marker=".", markersize=3, label="p95 per window")
-        ax3.fill_between(t3,
-                         valid["p50_lat"],
-                         valid["p95_lat"].fillna(valid["p50_lat"]),
-                         alpha=0.12, color="orange", label="p50–p95 band")
-        # Shade burst windows
-        for _, row in windows[windows["is_burst"]].iterrows():
-            ax3.axvspan(row["time_ms"] / 1000,
-                        (row["time_ms"] + s["window_ms"]) / 1000,
-                        alpha=0.12, color="red")
-    ax3.set_xlabel("Time (seconds)")
-    ax3.set_ylabel("Latency (ms)")
-    ax3.set_title(
-        f"③ p50 / p95 per {s['window_ms']} ms Window  (red shading = burst windows)"
-    )
-    ax3.legend(fontsize=9)
-    ax3.grid(True, alpha=0.3)
-
-    # ── Panel 4 (left): Latency by load level — 3-group bar chart ────────────
-    # Light (0-10%) / Normal (45-55%) / Heavy (90-100%) windows by request rate.
-    # Each cluster shows p50 / p95 / p99 — easy to explain to anyone.
-    ax4  = fig.add_subplot(gs[3, 0])
-    lg   = result.get("load_groups", {})
-    pcts     = ["p50", "p95", "p99"]
-    pct_keys = ["p50_ms", "p95_ms", "p99_ms"]
-    groups   = [
-        ("Light\n(0–10%)",   lg.get("light",  {}).get("latency", {}), "#5BA4CF"),
-        ("Normal\n(45–55%)", lg.get("normal", {}).get("latency", {}), "#F0A500"),
-        ("Heavy\n(90–100%)", lg.get("heavy",  {}).get("latency", {}), "#D94F3D"),
+    # ── Panel 3 (left): Latency by IO-count percentile — 4 groups ────────────
+    # Windows sorted by req_count, split into 0-30% / 31-60% / 61-90% / 91-100%.
+    # Shows p50 and p95 latency for each group — directly answers
+    # "does higher request rate cause higher latency?"
+    ax3 = fig.add_subplot(gs[2, 0])
+    lg  = result.get("load_groups", {})
+    group_defs = [
+        ("0–30%\n(Light)",   lg.get("q1", {})),
+        ("31–60%\n(Low-Mid)", lg.get("q2", {})),
+        ("61–90%\n(High-Mid)",lg.get("q3", {})),
+        ("91–100%\n(Heavy)",  lg.get("q4", {})),
     ]
+    colors_g = ["#5BA4CF", "#72B97C", "#F0A500", "#D94F3D"]
+    x_g      = np.arange(len(group_defs))
+    width_g  = 0.30
 
-    x     = np.arange(len(pcts))
-    width = 0.25
-    for i, (label, lat_d, color) in enumerate(groups):
-        vals = [lat_d.get(k) or 0 for k in pct_keys]
-        bars = ax4.bar(x + (i - 1) * width, vals, width,
-                       color=color, alpha=0.85, label=label)
-        for bar in bars:
-            h = bar.get_height()
-            if h > 0:
-                ax4.text(bar.get_x() + bar.get_width() / 2, h * 1.02,
-                         f"{h:.1f}", ha="center", va="bottom", fontsize=7)
+    avg_bars = []
+    p95_bars = []
+    for i, (label, grp) in enumerate(group_defs):
+        lat_d = grp.get("latency", {})
+        avg_v = lat_d.get("p50_ms") or 0
+        p95_v = lat_d.get("p95_ms") or 0
+        b_avg = ax3.bar(x_g[i] - width_g / 2, avg_v, width_g,
+                        color=colors_g[i], alpha=0.85)
+        b_p95 = ax3.bar(x_g[i] + width_g / 2, p95_v, width_g,
+                        color=colors_g[i], alpha=0.45, hatch="//")
+        for bar, val in [(b_avg, avg_v), (b_p95, p95_v)]:
+            if val > 0:
+                ax3.text(bar[0].get_x() + bar[0].get_width() / 2,
+                         val * 1.02, f"{val:.1f}",
+                         ha="center", va="bottom", fontsize=8)
+        avg_bars.append(b_avg)
+        p95_bars.append(b_p95)
 
-    ax4.set_xticks(x)
-    ax4.set_xticklabels(pcts)
-    ax4.set_ylabel("Latency (ms)")
-    ax4.set_title("④ Latency by Load Level\n(grouped by ops per window)", fontsize=10)
-    ax4.legend(fontsize=8, loc="upper left")
-    ax4.grid(True, alpha=0.3, axis="y")
+    ax3.set_xticks(x_g)
+    ax3.set_xticklabels([d[0] for d in group_defs], fontsize=9)
+    ax3.set_ylabel("Latency (ms)")
+    ax3.set_title("③ Latency by Load Group\n(windows ranked by ops/window)",
+                  fontsize=10)
+    # Custom legend: solid = p50, hatched = p95
+    from matplotlib.patches import Patch
+    ax3.legend(handles=[
+        Patch(facecolor="gray", alpha=0.85, label="p50 (median)"),
+        Patch(facecolor="gray", alpha=0.45, hatch="//", label="p95"),
+    ], fontsize=8, loc="upper left")
+    ax3.grid(True, alpha=0.3, axis="y")
 
-    # ── Panel 5 (right): Operation breakdown ──────────────────────────────────
-    ax5 = fig.add_subplot(gs[3, 1])
+    # ── Panel 4 (right): Operation breakdown ──────────────────────────────────
+    ax4 = fig.add_subplot(gs[2, 1])
     op_counts = df["op_name"].value_counts().head(12)
-    bars5 = ax5.barh(op_counts.index[::-1], op_counts.values[::-1],
+    bars4 = ax4.barh(op_counts.index[::-1], op_counts.values[::-1],
                      color="steelblue", alpha=0.8)
-    ax5.set_xlabel("Count")
-    ax5.set_title("⑤ Top Operations")
-    ax5.grid(True, alpha=0.3, axis="x")
-    for bar, val in zip(bars5, op_counts.values[::-1]):
-        ax5.text(bar.get_width() * 1.01, bar.get_y() + bar.get_height() / 2,
+    ax4.set_xlabel("Count")
+    ax4.set_title("④ Top Operations")
+    ax4.grid(True, alpha=0.3, axis="x")
+    for bar, val in zip(bars4, op_counts.values[::-1]):
+        ax4.text(bar.get_width() * 1.01, bar.get_y() + bar.get_height() / 2,
                  f"{val:,}", va="center", fontsize=8)
 
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
@@ -648,43 +637,44 @@ def print_report(result: dict, protocol: str) -> None:
     lg = result.get("load_groups", {})
     if lg:
         print()
-        print(f"  Latency by load level  "
-              f"(windows grouped by ops/{W}ms, lightest → busiest)")
-        print(f"  {'Group':<22}  {'Ops/'+str(W)+'ms':>10}  "
+        print(f"  Latency by load group  "
+              f"(windows ranked by ops/{W}ms)")
+        print(f"  {'Group':<24}  {'Ops/'+str(W)+'ms':>10}  "
               f"{'p50':>10}  {'p95':>10}  {'p99':>10}")
-        print(f"  {'-'*22}  {'-'*10}  {'-'*10}  {'-'*10}  {'-'*10}")
+        print(f"  {'-'*24}  {'-'*10}  {'-'*10}  {'-'*10}  {'-'*10}")
 
-        light_p95 = lg["light"]["latency"].get("p95_ms") or 0
+        q1_p95 = lg.get("q1", {}).get("latency", {}).get("p95_ms") or 0
         rows = [
-            ("Light load  (0–10%)",   lg["light"]),
-            ("Normal load (45–55%)",  lg["normal"]),
-            ("Heavy load  (90–100%)", lg["heavy"]),
+            ("0–30%   (Light)",    lg.get("q1", {})),
+            ("31–60%  (Low-Mid)",  lg.get("q2", {})),
+            ("61–90%  (High-Mid)", lg.get("q3", {})),
+            ("91–100% (Heavy)",    lg.get("q4", {})),
         ]
         for label, grp in rows:
-            lat_d  = grp["latency"]
-            p50    = lat_d.get("p50_ms")
-            p95    = lat_d.get("p95_ms")
-            p99    = lat_d.get("p99_ms")
-            p50_s  = f"{p50:>8.2f} ms" if p50 is not None else "       N/A"
-            p95_s  = f"{p95:>8.2f} ms" if p95 is not None else "       N/A"
-            p99_s  = f"{p99:>8.2f} ms" if p99 is not None else "       N/A"
-            print(f"  {label:<22}  {grp['ops_range']:>10}  {p50_s}  {p95_s}  {p99_s}")
+            lat_d = grp.get("latency", {})
+            p50   = lat_d.get("p50_ms")
+            p95   = lat_d.get("p95_ms")
+            p99   = lat_d.get("p99_ms")
+            p50_s = f"{p50:>8.2f} ms" if p50 is not None else "       N/A"
+            p95_s = f"{p95:>8.2f} ms" if p95 is not None else "       N/A"
+            p99_s = f"{p99:>8.2f} ms" if p99 is not None else "       N/A"
+            print(f"  {label:<24}  {grp.get('ops_range','N/A'):>10}  {p50_s}  {p95_s}  {p99_s}")
 
-        # Verdict based on heavy vs light p95
-        heavy_p95 = lg["heavy"]["latency"].get("p95_ms") or 0
-        if light_p95 > 0 and heavy_p95 > 0:
-            ratio = heavy_p95 / light_p95
+        # Verdict: compare heaviest group (q4) vs lightest group (q1) p95
+        q4_p95 = lg.get("q4", {}).get("latency", {}).get("p95_ms") or 0
+        if q1_p95 > 0 and q4_p95 > 0:
+            ratio = q4_p95 / q1_p95
             print()
             if ratio >= 2.0:
                 print(f"  ⚠  Heavy-load p95 is {ratio:.1f}× higher than light-load p95 "
-                      f"({light_p95:.2f} ms → {heavy_p95:.2f} ms).")
+                      f"({q1_p95:.2f} ms → {q4_p95:.2f} ms).")
                 print(f"     High request rate is degrading latency.")
             elif ratio >= 1.2:
                 print(f"  △  Heavy-load p95 is {ratio:.1f}× light-load p95 "
-                      f"({light_p95:.2f} ms → {heavy_p95:.2f} ms)  — moderate impact.")
+                      f"({q1_p95:.2f} ms → {q4_p95:.2f} ms)  — moderate impact.")
             else:
-                print(f"  ✓  Latency is stable across load levels "
-                      f"(p95: {light_p95:.2f} ms → {heavy_p95:.2f} ms).")
+                print(f"  ✓  Latency is stable across all load levels "
+                      f"(p95: {q1_p95:.2f} ms → {q4_p95:.2f} ms).")
                 print(f"     The storage system handles high request rates well.")
 
     if s["is_bursty"]:
