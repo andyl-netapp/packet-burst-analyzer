@@ -743,7 +743,9 @@ def main() -> None:
                         default="auto",
                         help="Protocol to analyze (default: auto-detect both)")
     parser.add_argument("--window", type=int, default=10, metavar="MS",
-                        help="Time window size in milliseconds (default: 10)")
+                        help="Time window size in milliseconds (default: 10, minimum: 1). "
+                             "Use smaller values (e.g. 1–5 ms) for finer granularity on "
+                             "captures with very fast bursts.")
     parser.add_argument("--sigma", type=float, default=2.0, metavar="N",
                         help="Burst threshold = mean + N×σ (default: 2.0)")
     parser.add_argument("--ops", nargs="+", metavar="OP",
@@ -763,6 +765,9 @@ def main() -> None:
 
     args = parser.parse_args()
     args_sigma = args.sigma
+
+    if args.window < 1:
+        sys.exit("ERROR: --window must be at least 1 ms.")
 
     pcap = Path(args.pcap)
     if not pcap.exists():
