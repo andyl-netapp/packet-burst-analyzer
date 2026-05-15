@@ -65,6 +65,7 @@ TSHARK_NFS_FIELDS = [
     "nfs.procedure_v4",
     "rpc.time",          # response time in seconds (populated on reply packets)
     "rpc.xid",
+    "nfs.count3",        # NFSv3 byte count for READ/WRITE (present on both call and reply)
 ]
 
 TSHARK_SMB2_FIELDS = [
@@ -75,6 +76,8 @@ TSHARK_SMB2_FIELDS = [
     "smb2.cmd",
     "smb2.time",             # response time in seconds (populated on response)
     "smb2.msg_id",
+    "smb2.file_data_length", # bytes transferred in READ response
+    "smb2.write_count",      # bytes confirmed in WRITE response
 ]
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -143,9 +146,9 @@ def extract_nfs(tshark: str, pcap: Path, client_ip: str | None = None) -> pd.Dat
 
     df = pd.read_csv(StringIO(out), sep="\t", low_memory=False)
     df.columns = ["timestamp", "src", "dst", "msgtyp",
-                  "proc_v3", "proc_v4", "rpc_time", "xid"]
+                  "proc_v3", "proc_v4", "rpc_time", "xid", "nfs_count"]
 
-    for col in ["timestamp", "msgtyp", "proc_v3", "proc_v4", "rpc_time"]:
+    for col in ["timestamp", "msgtyp", "proc_v3", "proc_v4", "rpc_time", "nfs_count"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
     # Resolve operation name (v3 takes precedence; fall back to v4)
@@ -165,9 +168,11 @@ def extract_smb2(tshark: str, pcap: Path, client_ip: str | None = None) -> pd.Da
 
     df = pd.read_csv(StringIO(out), sep="\t", low_memory=False)
     df.columns = ["timestamp", "src", "dst", "is_response",
-                  "cmd", "smb2_time", "msg_id"]
+                  "cmd", "smb2_time", "msg_id",
+                  "smb2_read_bytes", "smb2_write_bytes"]
 
-    for col in ["timestamp", "is_response", "cmd", "smb2_time"]:
+    for col in ["timestamp", "is_response", "cmd", "smb2_time",
+                "smb2_read_bytes", "smb2_write_bytes"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
     df["op_name"] = df["cmd"].apply(
@@ -182,7 +187,8 @@ def build_ops_df(raw: pd.DataFrame, protocol: str) -> pd.DataFrame:
       timestamp   — when the REQUEST was issued (seconds, epoch)
       latency_ms  — round-trip time in milliseconds
       op_name     — operation type string
-    
+      size_bytes  — payload bytes for READ/WRITE ops (NaN for others)
+
     Strategy: use REPLY packets that carry the response-time field.
     Request timestamp = reply_timestamp - rpc/smb2_time.
     """
@@ -193,17 +199,20 @@ def build_ops_df(raw: pd.DataFrame, protocol: str) -> pd.DataFrame:
         replies = raw[raw["msgtyp"] == 1].dropna(subset=["rpc_time"]).copy()
         if replies.empty:
             return pd.DataFrame()
-        replies["timestamp"] = replies["timestamp"] - replies["rpc_time"]
+        replies["timestamp"]  = replies["timestamp"] - replies["rpc_time"]
         replies["latency_ms"] = replies["rpc_time"] * 1000
-        return replies[["timestamp", "latency_ms", "op_name"]].reset_index(drop=True)
+        replies["size_bytes"] = replies["nfs_count"]
+        return replies[["timestamp", "latency_ms", "op_name", "size_bytes"]].reset_index(drop=True)
 
     elif protocol == "smb2":
         responses = raw[raw["is_response"] == 1].dropna(subset=["smb2_time"]).copy()
         if responses.empty:
             return pd.DataFrame()
-        responses["timestamp"] = responses["timestamp"] - responses["smb2_time"]
+        responses["timestamp"]  = responses["timestamp"] - responses["smb2_time"]
         responses["latency_ms"] = responses["smb2_time"] * 1000
-        return responses[["timestamp", "latency_ms", "op_name"]].reset_index(drop=True)
+        # READ response carries smb2_read_bytes; WRITE response carries smb2_write_bytes
+        responses["size_bytes"] = responses["smb2_read_bytes"].fillna(responses["smb2_write_bytes"])
+        return responses[["timestamp", "latency_ms", "op_name", "size_bytes"]].reset_index(drop=True)
 
     return pd.DataFrame()
 
@@ -335,6 +344,18 @@ def analyze(
         .to_dict("records")
     )
 
+    # ── Average READ / WRITE op size ──────────────────────────────────────────
+    def _avg_size_kb(op: str) -> float | None:
+        """Return average op size in KiB for a given op_name, or None if no data."""
+        s = df.loc[df["op_name"] == op, "size_bytes"].dropna()
+        return round(float(s.mean()) / 1024, 1) if not s.empty else None
+
+    avg_read_size_kb  = _avg_size_kb("READ")
+    avg_write_size_kb = _avg_size_kb("WRITE")
+
+    # Overall average latency across all ops (all op types combined)
+    avg_latency_ms = round(float(df["latency_ms"].mean()), 3) if not df["latency_ms"].dropna().empty else None
+
     return {
         "windows": windows,
         "df": df,
@@ -343,6 +364,9 @@ def analyze(
             # duration_sec = last_response_time − first_request_time
             # (excludes idle time at the beginning/end of the capture)
             "total_ops":            int(len(df)),
+            "avg_latency_ms":       avg_latency_ms,
+            "avg_read_size_kb":     avg_read_size_kb,
+            "avg_write_size_kb":    avg_write_size_kb,
             "window_ms":            window_ms,
             "n_windows":            n_windows,
             "mean_ops_per_window":  round(mean_c, 2),
@@ -505,6 +529,19 @@ def print_report(result: dict, protocol: str) -> None:
     print(f"  Active duration  :  {s['duration_sec']:.1f} s  "
           f"(first request → last response, excludes capture idle time)")
     print(f"  Total operations :  {s['total_ops']:,}")
+    print()
+
+    # Average latency & op sizes — the first numbers a customer wants to see
+    avg_lat = s.get("avg_latency_ms")
+    if avg_lat is not None:
+        print(f"  Average latency  :  {avg_lat:.3f} ms  (all operations)")
+    avg_r = s.get("avg_read_size_kb")
+    avg_w = s.get("avg_write_size_kb")
+    if avg_r is not None or avg_w is not None:
+        r_str = f"READ  {avg_r:>7.1f} KiB" if avg_r is not None else ""
+        w_str = f"WRITE {avg_w:>7.1f} KiB" if avg_w is not None else ""
+        parts = "   ".join(p for p in [r_str, w_str] if p)
+        print(f"  Avg op size      :  {parts}")
     print()
     print(f"  Request rate per {W} ms window")
     print(f"    Average          :  {s['mean_ops_per_window']:.1f} ops  "
