@@ -404,7 +404,15 @@ def plot_analysis(result: dict, protocol: str, out_path: Path) -> None:
     s       = result["summary"]
     lat     = result["latency"]
 
-    fig = plt.figure(figsize=(16, 12))
+    # Pre-compute burst / non-burst masks on the ops DataFrame
+    burst_wins    = set(windows.loc[windows["is_burst"], "win"])
+    nonburst_wins = set(windows.loc[~windows["is_burst"] & (windows["req_count"] > 0), "win"])
+    is_burst_op    = df["win"].isin(burst_wins)
+    is_nonburst_op = df["win"].isin(nonburst_wins)
+
+    min_t = df["timestamp"].min()   # relative-time anchor
+
+    fig = plt.figure(figsize=(16, 14))
     fig.suptitle(
         f"{protocol.upper()} Burstiness Analysis\n"
         f"Duration: {s['duration_sec']:.1f}s | "
@@ -415,13 +423,13 @@ def plot_analysis(result: dict, protocol: str, out_path: Path) -> None:
         fontsize=13, fontweight="bold",
     )
 
-    gs = gridspec.GridSpec(3, 2, figure=fig, hspace=0.45, wspace=0.35)
+    gs = gridspec.GridSpec(4, 2, figure=fig, hspace=0.55, wspace=0.35)
 
-    # ── Panel 1: Request rate over time ───────────────────────────────────────
+    # ── Panel 1: Request rate over time (full width) ───────────────────────────
     ax1 = fig.add_subplot(gs[0, :])
-    t_s  = windows["time_ms"] / 1000
-    w_s  = s["window_ms"] / 1000
-    bm   = windows["is_burst"]
+    t_s = windows["time_ms"] / 1000
+    w_s = s["window_ms"] / 1000
+    bm  = windows["is_burst"]
 
     ax1.bar(t_s[~bm], windows["req_count"][~bm], width=w_s,
             color="steelblue", alpha=0.7, label="Normal")
@@ -433,69 +441,110 @@ def plot_analysis(result: dict, protocol: str, out_path: Path) -> None:
                 linewidth=1.2, label=f"Mean ({s['mean_ops_per_window']:.1f})")
     ax1.set_xlabel("Time (seconds)")
     ax1.set_ylabel(f"Ops / {s['window_ms']}ms window")
-    ax1.set_title("Request Rate Over Time  (red = burst windows)")
+    ax1.set_title("① Request Rate Over Time  (red = burst windows)")
     ax1.legend(loc="upper right", fontsize=9)
     ax1.grid(True, alpha=0.3)
 
-    # ── Panel 2: Latency over time (p50 + p95 with burst shading) ─────────────
+    # ── Panel 2: Individual op latency scatter (full width) ────────────────────
+    # Each dot = one completed operation.  Burst ops in red, normal ops in blue.
+    # This immediately shows *when* latency spikes occur and their magnitude.
     ax2 = fig.add_subplot(gs[1, :])
-    valid = windows.dropna(subset=["p95_lat"])
+    t_nb = df.loc[is_nonburst_op, "timestamp"] - min_t
+    t_b  = df.loc[is_burst_op,    "timestamp"] - min_t
+    l_nb = df.loc[is_nonburst_op, "latency_ms"]
+    l_b  = df.loc[is_burst_op,    "latency_ms"]
+
+    ax2.scatter(t_nb, l_nb, s=4, alpha=0.35, color="steelblue",
+                label=f"Normal (n={len(l_nb):,})", rasterized=True)
+    ax2.scatter(t_b,  l_b,  s=6, alpha=0.7,  color="crimson",
+                label=f"Burst  (n={len(l_b):,})", rasterized=True)
+
+    # Overlay running median (rolling p50) for trend clarity
+    if not df.empty:
+        sorted_df = df.sort_values("timestamp")
+        roll_win  = max(20, len(sorted_df) // 200)   # adaptive window
+        rolling_p50 = sorted_df["latency_ms"].rolling(roll_win, center=True, min_periods=1).median()
+        ax2.plot(sorted_df["timestamp"] - min_t, rolling_p50,
+                 color="gold", lw=1.5, alpha=0.9, label=f"Rolling p50 (w={roll_win})")
+
+    ax2.set_xlabel("Time (seconds)")
+    ax2.set_ylabel("Latency (ms)")
+    ax2.set_title("② Per-Operation Latency Over Time  (each dot = 1 op)")
+    ax2.legend(loc="upper right", fontsize=9)
+    ax2.grid(True, alpha=0.2)
+
+    # ── Panel 3: Per-window p50 + p95 lines (full width) ──────────────────────
+    # Shows the rolling percentile trend without noise of individual ops.
+    ax3 = fig.add_subplot(gs[2, :])
+    valid = windows.dropna(subset=["p50_lat"])
     if not valid.empty:
-        t2 = valid["time_ms"] / 1000
-        ax2.plot(t2, valid["p50_lat"], color="steelblue", lw=0.9, label="p50")
-        ax2.plot(t2, valid["p95_lat"], color="darkorange", lw=1.1, label="p95")
-        ax2.fill_between(t2, valid["p50_lat"], valid["p95_lat"],
-                         alpha=0.15, color="orange")
+        t3 = valid["time_ms"] / 1000
+        ax3.plot(t3, valid["p50_lat"], color="steelblue", lw=1.2,
+                 marker=".", markersize=3, label="p50 per window")
+        ax3.plot(t3, valid["p95_lat"].fillna(np.nan), color="darkorange", lw=1.2,
+                 marker=".", markersize=3, label="p95 per window")
+        ax3.fill_between(t3,
+                         valid["p50_lat"],
+                         valid["p95_lat"].fillna(valid["p50_lat"]),
+                         alpha=0.12, color="orange", label="p50–p95 band")
         # Shade burst windows
         for _, row in windows[windows["is_burst"]].iterrows():
-            ax2.axvspan(row["time_ms"] / 1000,
+            ax3.axvspan(row["time_ms"] / 1000,
                         (row["time_ms"] + s["window_ms"]) / 1000,
                         alpha=0.12, color="red")
-        ax2.set_xlabel("Time (seconds)")
-        ax2.set_ylabel("Latency (ms)")
-        ax2.set_title("Per-Window Latency (p50/p95)  — red shading = burst windows")
-        ax2.legend(fontsize=9)
-        ax2.grid(True, alpha=0.3)
-
-    # ── Panel 3: Latency CDF comparison ───────────────────────────────────────
-    ax3 = fig.add_subplot(gs[2, 0])
-    burst_lats    = df.loc[df["win"].isin(windows.loc[windows["is_burst"], "win"]),
-                           "latency_ms"].dropna()
-    nonburst_lats = df.loc[df["win"].isin(
-                               windows.loc[~windows["is_burst"] & (windows["req_count"] > 0), "win"]),
-                           "latency_ms"].dropna()
-
-    for series, color, label in [
-        (nonburst_lats, "steelblue", "Non-burst"),
-        (burst_lats,    "crimson",   "Burst"),
-    ]:
-        if series.empty:
-            continue
-        sv  = np.sort(series.values)
-        cdf = np.arange(1, len(sv) + 1) / len(sv)
-        ax3.plot(sv, cdf, color=color, lw=1.5,
-                 label=f"{label} (n={len(series):,})")
-
-    ax3.set_xlabel("Latency (ms)")
-    ax3.set_ylabel("CDF")
-    ax3.set_title("Latency CDF: Burst vs Non-Burst")
+    ax3.set_xlabel("Time (seconds)")
+    ax3.set_ylabel("Latency (ms)")
+    ax3.set_title(
+        f"③ p50 / p95 per {s['window_ms']} ms Window  (red shading = burst windows)"
+    )
     ax3.legend(fontsize=9)
     ax3.grid(True, alpha=0.3)
-    mw = lat.get("mann_whitney")
-    if mw:
-        sig = "p<0.05 ✓" if mw["p_value"] < 0.05 else f"p={mw['p_value']:.3f}"
-        ax3.set_title(f"Latency CDF: Burst vs Non-Burst  [{sig}]")
 
-    # ── Panel 4: Operation breakdown ──────────────────────────────────────────
-    ax4 = fig.add_subplot(gs[2, 1])
+    # ── Panel 4 (left): Burst vs Non-burst latency grouped bar chart ──────────
+    # Replaces the CDF.  Shows p50 / p95 / p99 side by side — easy to explain.
+    ax4 = fig.add_subplot(gs[3, 0])
+    mw  = lat.get("mann_whitney")
+    bl  = lat.get("burst",     {})
+    nbl = lat.get("non_burst", {})
+    pcts     = ["p50", "p95", "p99"]
+    pct_keys = ["p50_ms", "p95_ms", "p99_ms"]
+    nb_vals = [nbl.get(k, 0) or 0 for k in pct_keys]
+    b_vals  = [bl.get(k,  0) or 0 for k in pct_keys]
+
+    x      = np.arange(len(pcts))
+    width  = 0.35
+    bars_nb = ax4.bar(x - width / 2, nb_vals, width, color="steelblue",
+                      alpha=0.8, label="Normal")
+    bars_b  = ax4.bar(x + width / 2, b_vals,  width, color="crimson",
+                      alpha=0.8, label="Burst")
+
+    for bar in list(bars_nb) + list(bars_b):
+        h = bar.get_height()
+        if h > 0:
+            ax4.text(bar.get_x() + bar.get_width() / 2, h * 1.02,
+                     f"{h:.1f}", ha="center", va="bottom", fontsize=8)
+
+    ax4.set_xticks(x)
+    ax4.set_xticklabels(pcts)
+    ax4.set_ylabel("Latency (ms)")
+    title4 = "④ Latency: Normal vs Burst"
+    if mw:
+        sig = "p<0.05 ✓ significant" if mw["p_value"] < 0.05 else f"p={mw['p_value']:.2f}"
+        title4 += f"\n[{sig}]"
+    ax4.set_title(title4, fontsize=10)
+    ax4.legend(fontsize=9)
+    ax4.grid(True, alpha=0.3, axis="y")
+
+    # ── Panel 5 (right): Operation breakdown ──────────────────────────────────
+    ax5 = fig.add_subplot(gs[3, 1])
     op_counts = df["op_name"].value_counts().head(12)
-    bars = ax4.barh(op_counts.index[::-1], op_counts.values[::-1],
-                    color="steelblue", alpha=0.8)
-    ax4.set_xlabel("Count")
-    ax4.set_title("Top Operations")
-    ax4.grid(True, alpha=0.3, axis="x")
-    for bar, val in zip(bars, op_counts.values[::-1]):
-        ax4.text(bar.get_width() * 1.01, bar.get_y() + bar.get_height() / 2,
+    bars5 = ax5.barh(op_counts.index[::-1], op_counts.values[::-1],
+                     color="steelblue", alpha=0.8)
+    ax5.set_xlabel("Count")
+    ax5.set_title("⑤ Top Operations")
+    ax5.grid(True, alpha=0.3, axis="x")
+    for bar, val in zip(bars5, op_counts.values[::-1]):
+        ax5.text(bar.get_width() * 1.01, bar.get_y() + bar.get_height() / 2,
                  f"{val:,}", va="center", fontsize=8)
 
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
