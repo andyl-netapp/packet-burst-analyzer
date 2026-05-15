@@ -631,11 +631,20 @@ def print_report(result: dict, protocol: str) -> None:
         for pct_label, key in [("p50", "p50_ms"), ("p95", "p95_ms"), ("p99", "p99_ms")]:
             nb_val = nbl.get(key, 0.0)
             b_val  = bl.get(key,  0.0)
-            ratio  = b_val / nb_val if nb_val > 0 else 0.0
-            arrow  = "⚠ " if ratio >= 2.0 else "  "
-            print(f"    {pct_label}  normal={nb_val:>8.2f} ms   "
-                  f"burst={b_val:>8.2f} ms   "
-                  f"{arrow}{_ratio_tag(ratio)} higher during bursts")
+            if nb_val > 0:
+                ratio = b_val / nb_val
+                if ratio >= 2.0:
+                    tag = f"⚠  {ratio:.1f}× higher during bursts"
+                elif ratio > 1.05:
+                    tag = f"   {ratio:.1f}× higher during bursts"
+                elif ratio < 0.95:
+                    pct_lower = int((1 - ratio) * 100)
+                    tag = f"   {pct_lower}% lower during bursts"
+                else:
+                    tag = "   similar in both periods"
+            else:
+                tag = ""
+            print(f"    {pct_label}  normal={nb_val:>8.2f} ms   burst={b_val:>8.2f} ms   {tag}")
 
     # Statistical significance (one line, plain language)
     mw = lat.get("mann_whitney")
@@ -647,9 +656,20 @@ def print_report(result: dict, protocol: str) -> None:
             print(f"\n  Latency difference is not statistically significant "
                   f"(p={mw['p_value']:.2e}).")
 
-    verdict = ("⚠   CONCLUSION: Bursty workload is present and is causing higher latency."
-               if s["is_bursty"]
-               else "✓   CONCLUSION: No significant burstiness detected.")
+    # Verdict: consider both burstiness AND latency impact
+    bl_p95  = bl.get("p95_ms",  0) or 0
+    nbl_p95 = nbl.get("p95_ms", 0) or 0
+    lat_impact = bl_p95 >= nbl_p95 * 1.5 if nbl_p95 > 0 else False
+
+    if s["is_bursty"] and lat_impact:
+        verdict = "⚠   CONCLUSION: Bursty workload detected and is causing higher latency."
+    elif s["is_bursty"] and not lat_impact:
+        verdict = ("⚠   CONCLUSION: Bursty workload detected, but latency is NOT higher "
+                   "during burst periods.\n"
+                   "             The storage system is handling the bursts well, "
+                   "or burst windows contain faster operation types.")
+    else:
+        verdict = "✓   CONCLUSION: No significant burstiness detected."
     print(f"\n  {verdict}")
 
     # ── Section 2: Top burst windows (concrete evidence) ─────────────────────
@@ -664,21 +684,7 @@ def print_report(result: dict, protocol: str) -> None:
             p95_s = f"{p95:>12.2f}" if p95 and not np.isnan(p95) else "          N/A"
             print(f"  {t_s:>10.3f}   {w['req_count']:>6}   {p95_s}")
 
-    # ── Section 3: Technical details (for storage engineers) ─────────────────
-    print(f"\n  TECHNICAL DETAILS  (for storage engineers)")
-    print(sep)
-    cv_tag   = "HIGH — bursty"   if s["cv"]          > 1.0 else "normal"
-    fano_tag = "HIGH — clustered" if s["fano_factor"] > 2.0 else "near-Poisson"
-    print(f"  Coefficient of Variation (CV) :  {s['cv']:.4f}   [{cv_tag}]")
-    print(f"  Fano Factor (var / mean)      :  {s['fano_factor']:.4f}   [{fano_tag}]")
-    print(f"  Burst Ratio (peak / mean − 1) :  {s['burst_ratio']:.4f}   "
-          f"({s['burst_ratio']*100:.0f}% above mean)")
-    print(f"  Burst threshold               :  mean + {args_sigma:.1f}σ  "
-          f"= {s['burst_threshold']:.1f} ops/{W} ms")
-    if mw:
-        print(f"  Mann-Whitney U p-value        :  {mw['p_value']:.4e}")
-
-    # ── Section 4: Latency detail table ──────────────────────────────────────
+    # ── Section 3: Latency detail table ──────────────────────────────────────
     print(f"\n  LATENCY TABLE")
     print(sep)
 
@@ -695,7 +701,7 @@ def print_report(result: dict, protocol: str) -> None:
     print(fmt(lat.get("burst"),     "Burst"))
     print(fmt(lat.get("overall"),   "Overall"))
 
-    # ── Section 5: Operation breakdown ───────────────────────────────────────
+    # ── Section 4: Operation breakdown ───────────────────────────────────────
     print(f"\n  OPERATION BREAKDOWN  (top 10)")
     print(sep)
     for op, cnt in sorted(result["op_breakdown"].items(), key=lambda x: -x[1])[:10]:
