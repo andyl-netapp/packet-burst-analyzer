@@ -331,6 +331,9 @@ def analyze(
     cv           = std_c / mean_c if mean_c > 0 else 0.0
     fano         = counts.var() / mean_c if mean_c > 0 else 0.0
     burst_ratio  = (float(counts.max()) - mean_c) / mean_c if mean_c > 0 else 0.0
+    peak_to_mean = float(counts.max()) / mean_c if mean_c > 0 else 1.0
+    p90_window   = float(np.percentile(counts, 90))
+    p95_window   = float(np.percentile(counts, 95))
 
     # Latency split
     burst_idx    = windows.loc[windows["is_burst"], "win"]
