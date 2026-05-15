@@ -345,19 +345,36 @@ def analyze(
         stat, pval = stats.mannwhitneyu(burst_lats, nonburst_lats, alternative="greater")
         mw_result = {"statistic": float(stat), "p_value": float(pval)}
 
-    # ── Extra intuitive metrics ───────────────────────────────────────────────
-    peak_to_mean  = float(counts.max()) / mean_c if mean_c > 0 else 0.0
-    # Typical busy level: 90th / 95th percentile of non-zero windows
-    nonzero_counts = counts[counts > 0]
-    p90_window = float(np.percentile(nonzero_counts, 90)) if not nonzero_counts.empty else 0.0
-    p95_window = float(np.percentile(nonzero_counts, 95)) if not nonzero_counts.empty else 0.0
+    # ── Load-level latency groups ─────────────────────────────────────────────
+    # Sort active windows by request count and split into three percentile bands.
+    # This avoids arbitrary burst thresholds and directly answers:
+    # "Does latency get worse as request rate increases?"
+    active_wins = windows[windows["req_count"] > 0].copy()
+    active_wins = active_wins.sort_values("req_count")
+    n_active    = len(active_wins)
 
-    # Top-5 busiest windows (for showing concrete examples to customers)
-    top_windows = (
-        windows[windows["req_count"] > 0]
-        .nlargest(5, "req_count")[["time_ms", "req_count", "p95_lat"]]
-        .to_dict("records")
-    )
+    def _win_group(lo_pct: float, hi_pct: float) -> dict:
+        """Return latency stats + req_count range for windows in [lo_pct, hi_pct)."""
+        lo = int(np.floor(lo_pct / 100 * n_active))
+        hi = int(np.ceil( hi_pct / 100 * n_active))
+        hi = max(hi, lo + 1)   # at least one window
+        group_wins = active_wins.iloc[lo:hi]
+        win_ids    = set(group_wins["win"])
+        lats       = df.loc[df["win"].isin(win_ids), "latency_ms"].dropna()
+        cnt_min    = int(group_wins["req_count"].min())
+        cnt_max    = int(group_wins["req_count"].max())
+        cnt_range  = f"{cnt_min}" if cnt_min == cnt_max else f"{cnt_min}–{cnt_max}"
+        return {
+            "win_count":  len(group_wins),
+            "ops_range":  cnt_range,
+            "latency":    lat_stats(lats),
+        }
+
+    load_groups = {
+        "light":  _win_group(0,  10),   # quietest 10 %
+        "normal": _win_group(45, 55),   # middle 10 %
+        "heavy":  _win_group(90, 100),  # busiest 10 %
+    }
 
     # ── Average READ / WRITE op size ──────────────────────────────────────────
     def _avg_size_kb(op: str) -> float | None:
@@ -372,8 +389,9 @@ def analyze(
     avg_latency_ms = round(float(df["latency_ms"].mean()), 3) if not df["latency_ms"].dropna().empty else None
 
     return {
-        "windows": windows,
-        "df": df,
+        "windows":     windows,
+        "df":          df,
+        "load_groups": load_groups,
         "summary": {
             "duration_sec":         round(duration_sec, 3),
             # duration_sec = last_response_time − first_request_time
@@ -402,9 +420,6 @@ def analyze(
         },
         "latency": {
             "overall":      lat_stats(df["latency_ms"]),
-            "burst":        lat_stats(burst_lats),
-            "non_burst":    lat_stats(nonburst_lats),
-            "mann_whitney": mw_result,
         },
         "op_breakdown": df["op_name"].value_counts().to_dict(),
     }
@@ -515,39 +530,36 @@ def plot_analysis(result: dict, protocol: str, out_path: Path) -> None:
     ax3.legend(fontsize=9)
     ax3.grid(True, alpha=0.3)
 
-    # ── Panel 4 (left): Burst vs Non-burst latency grouped bar chart ──────────
-    # Replaces the CDF.  Shows p50 / p95 / p99 side by side — easy to explain.
-    ax4 = fig.add_subplot(gs[3, 0])
-    mw  = lat.get("mann_whitney")
-    bl  = lat.get("burst",     {})
-    nbl = lat.get("non_burst", {})
+    # ── Panel 4 (left): Latency by load level — 3-group bar chart ────────────
+    # Light (0-10%) / Normal (45-55%) / Heavy (90-100%) windows by request rate.
+    # Each cluster shows p50 / p95 / p99 — easy to explain to anyone.
+    ax4  = fig.add_subplot(gs[3, 0])
+    lg   = result.get("load_groups", {})
     pcts     = ["p50", "p95", "p99"]
     pct_keys = ["p50_ms", "p95_ms", "p99_ms"]
-    nb_vals = [nbl.get(k, 0) or 0 for k in pct_keys]
-    b_vals  = [bl.get(k,  0) or 0 for k in pct_keys]
+    groups   = [
+        ("Light\n(0–10%)",   lg.get("light",  {}).get("latency", {}), "#5BA4CF"),
+        ("Normal\n(45–55%)", lg.get("normal", {}).get("latency", {}), "#F0A500"),
+        ("Heavy\n(90–100%)", lg.get("heavy",  {}).get("latency", {}), "#D94F3D"),
+    ]
 
-    x      = np.arange(len(pcts))
-    width  = 0.35
-    bars_nb = ax4.bar(x - width / 2, nb_vals, width, color="steelblue",
-                      alpha=0.8, label="Normal")
-    bars_b  = ax4.bar(x + width / 2, b_vals,  width, color="crimson",
-                      alpha=0.8, label="Burst")
-
-    for bar in list(bars_nb) + list(bars_b):
-        h = bar.get_height()
-        if h > 0:
-            ax4.text(bar.get_x() + bar.get_width() / 2, h * 1.02,
-                     f"{h:.1f}", ha="center", va="bottom", fontsize=8)
+    x     = np.arange(len(pcts))
+    width = 0.25
+    for i, (label, lat_d, color) in enumerate(groups):
+        vals = [lat_d.get(k) or 0 for k in pct_keys]
+        bars = ax4.bar(x + (i - 1) * width, vals, width,
+                       color=color, alpha=0.85, label=label)
+        for bar in bars:
+            h = bar.get_height()
+            if h > 0:
+                ax4.text(bar.get_x() + bar.get_width() / 2, h * 1.02,
+                         f"{h:.1f}", ha="center", va="bottom", fontsize=7)
 
     ax4.set_xticks(x)
     ax4.set_xticklabels(pcts)
     ax4.set_ylabel("Latency (ms)")
-    title4 = "④ Latency: Normal vs Burst"
-    if mw:
-        sig = "p<0.05 ✓ significant" if mw["p_value"] < 0.05 else f"p={mw['p_value']:.2f}"
-        title4 += f"\n[{sig}]"
-    ax4.set_title(title4, fontsize=10)
-    ax4.legend(fontsize=9)
+    ax4.set_title("④ Latency by Load Level\n(grouped by ops per window)", fontsize=10)
+    ax4.legend(fontsize=8, loc="upper left")
     ax4.grid(True, alpha=0.3, axis="y")
 
     # ── Panel 5 (right): Operation breakdown ──────────────────────────────────
@@ -622,60 +634,59 @@ def print_report(result: dict, protocol: str) -> None:
     print(f"  Burst periods      :  {nb} out of {nw} windows ({bp:.1f}% of the time)")
     print(f"  Burst threshold    :  > {s['burst_threshold']:.0f} ops/{W} ms")
 
-    # Latency impact — the numbers customers care about most
-    bl  = lat.get("burst",     {})
-    nbl = lat.get("non_burst", {})
-    if bl and nbl:
+    # ── Latency by load level ─────────────────────────────────────────────────
+    lg = result.get("load_groups", {})
+    if lg:
         print()
-        print(f"  Latency during normal periods vs. burst periods")
-        for pct_label, key in [("p50", "p50_ms"), ("p95", "p95_ms"), ("p99", "p99_ms")]:
-            nb_val = nbl.get(key, 0.0)
-            b_val  = bl.get(key,  0.0)
-            if nb_val > 0:
-                ratio = b_val / nb_val
-                if ratio >= 2.0:
-                    tag = f"⚠  {ratio:.1f}× higher during bursts"
-                elif ratio > 1.05:
-                    tag = f"   {ratio:.1f}× higher during bursts"
-                elif ratio < 0.95:
-                    pct_lower = int((1 - ratio) * 100)
-                    tag = f"   {pct_lower}% lower during bursts"
-                else:
-                    tag = "   similar in both periods"
+        print(f"  Latency by load level  "
+              f"(windows grouped by ops/{W}ms, lightest → busiest)")
+        print(f"  {'Group':<22}  {'Ops/'+str(W)+'ms':>10}  "
+              f"{'p50':>10}  {'p95':>10}  {'p99':>10}")
+        print(f"  {'-'*22}  {'-'*10}  {'-'*10}  {'-'*10}  {'-'*10}")
+
+        light_p95 = lg["light"]["latency"].get("p95_ms") or 0
+        rows = [
+            ("Light load  (0–10%)",   lg["light"]),
+            ("Normal load (45–55%)",  lg["normal"]),
+            ("Heavy load  (90–100%)", lg["heavy"]),
+        ]
+        for label, grp in rows:
+            lat_d  = grp["latency"]
+            p50    = lat_d.get("p50_ms")
+            p95    = lat_d.get("p95_ms")
+            p99    = lat_d.get("p99_ms")
+            p50_s  = f"{p50:>8.2f} ms" if p50 is not None else "       N/A"
+            p95_s  = f"{p95:>8.2f} ms" if p95 is not None else "       N/A"
+            p99_s  = f"{p99:>8.2f} ms" if p99 is not None else "       N/A"
+            print(f"  {label:<22}  {grp['ops_range']:>10}  {p50_s}  {p95_s}  {p99_s}")
+
+        # Verdict based on heavy vs light p95
+        heavy_p95 = lg["heavy"]["latency"].get("p95_ms") or 0
+        if light_p95 > 0 and heavy_p95 > 0:
+            ratio = heavy_p95 / light_p95
+            print()
+            if ratio >= 2.0:
+                print(f"  ⚠  Heavy-load p95 is {ratio:.1f}× higher than light-load p95 "
+                      f"({light_p95:.2f} ms → {heavy_p95:.2f} ms).")
+                print(f"     High request rate is degrading latency.")
+            elif ratio >= 1.2:
+                print(f"  △  Heavy-load p95 is {ratio:.1f}× light-load p95 "
+                      f"({light_p95:.2f} ms → {heavy_p95:.2f} ms)  — moderate impact.")
             else:
-                tag = ""
-            print(f"    {pct_label}  normal={nb_val:>8.2f} ms   burst={b_val:>8.2f} ms   {tag}")
+                print(f"  ✓  Latency is stable across load levels "
+                      f"(p95: {light_p95:.2f} ms → {heavy_p95:.2f} ms).")
+                print(f"     The storage system handles high request rates well.")
 
-    # Statistical significance (one line, plain language)
-    mw = lat.get("mann_whitney")
-    if mw:
-        if mw["p_value"] < 0.05:
-            print(f"\n  Latency increase during bursts is statistically significant "
-                  f"(p={mw['p_value']:.2e}).")
-        else:
-            print(f"\n  Latency difference is not statistically significant "
-                  f"(p={mw['p_value']:.2e}).")
-
-    # Verdict: consider both burstiness AND latency impact
-    bl_p95  = bl.get("p95_ms",  0) or 0
-    nbl_p95 = nbl.get("p95_ms", 0) or 0
-    lat_impact = bl_p95 >= nbl_p95 * 1.5 if nbl_p95 > 0 else False
-
-    if s["is_bursty"] and lat_impact:
-        verdict = "⚠   CONCLUSION: Bursty workload detected and is causing higher latency."
-    elif s["is_bursty"] and not lat_impact:
-        verdict = ("⚠   CONCLUSION: Bursty workload detected, but latency is NOT higher "
-                   "during burst periods.\n"
-                   "             The storage system is handling the bursts well, "
-                   "or burst windows contain faster operation types.")
+    if s["is_bursty"]:
+        print(f"\n  ⚠   CONCLUSION: Request rate is bursty "
+              f"(peak {_ratio_tag(s['peak_to_mean_ratio'])} the average).")
     else:
-        verdict = "✓   CONCLUSION: No significant burstiness detected."
-    print(f"\n  {verdict}")
+        print(f"\n  ✓   CONCLUSION: No significant burstiness detected.")
 
     # ── Section 2: Top burst windows (concrete evidence) ─────────────────────
     top = s.get("top_burst_windows", [])
     if top:
-        print(f"\n  Top {len(top)} busiest {W} ms windows (concrete burst examples)")
+        print(f"\n  Top {len(top)} busiest {W} ms windows")
         print(f"  {'Time (s)':>10}   {'Ops':>6}   {'p95 lat (ms)':>14}")
         print(f"  {'-'*10}   {'-'*6}   {'-'*14}")
         for w in top:
@@ -684,8 +695,8 @@ def print_report(result: dict, protocol: str) -> None:
             p95_s = f"{p95:>12.2f}" if p95 and not np.isnan(p95) else "          N/A"
             print(f"  {t_s:>10.3f}   {w['req_count']:>6}   {p95_s}")
 
-    # ── Section 3: Latency detail table ──────────────────────────────────────
-    print(f"\n  LATENCY TABLE")
+    # ── Section 3: Overall latency table ─────────────────────────────────────
+    print(f"\n  LATENCY TABLE  (all operations)")
     print(sep)
 
     def fmt(d: dict, label: str) -> str:
@@ -697,9 +708,7 @@ def print_report(result: dict, protocol: str) -> None:
                 f"p99={d.get('p99_ms', 0):>8.2f} ms  "
                 f"max={d.get('max_ms', 0):>8.2f} ms")
 
-    print(fmt(lat.get("non_burst"), "Non-burst"))
-    print(fmt(lat.get("burst"),     "Burst"))
-    print(fmt(lat.get("overall"),   "Overall"))
+    print(fmt(lat.get("overall"), "Overall"))
 
     # ── Section 4: Operation breakdown ───────────────────────────────────────
     print(f"\n  OPERATION BREAKDOWN  (top 10)")
