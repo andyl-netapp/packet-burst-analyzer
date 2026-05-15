@@ -258,9 +258,12 @@ def analyze(
         if df.empty:
             return None
 
-    min_t = df["timestamp"].min()
-    max_t = df["timestamp"].max()
-    duration_sec = max_t - min_t
+    # Active window: from the first REQUEST to the last RESPONSE.
+    # Using last-response (= request_ts + latency) avoids under-counting
+    # when the capture has idle time at the start or end of the file.
+    min_t = df["timestamp"].min()                                    # first request
+    last_response_t = (df["timestamp"] + df["latency_ms"] / 1000).max()  # last response
+    duration_sec = last_response_t - min_t
     if duration_sec <= 0:
         return None
 
@@ -337,6 +340,8 @@ def analyze(
         "df": df,
         "summary": {
             "duration_sec":         round(duration_sec, 3),
+            # duration_sec = last_response_time − first_request_time
+            # (excludes idle time at the beginning/end of the capture)
             "total_ops":            int(len(df)),
             "window_ms":            window_ms,
             "n_windows":            n_windows,
@@ -497,7 +502,8 @@ def print_report(result: dict, protocol: str) -> None:
     # ── Section 1: Plain-language summary (for customer presentations) ────────
     print(f"\n  SUMMARY  (suitable for customer / management presentation)")
     print(sep)
-    print(f"  Capture duration :  {s['duration_sec']:.1f} s")
+    print(f"  Active duration  :  {s['duration_sec']:.1f} s  "
+          f"(first request → last response, excludes capture idle time)")
     print(f"  Total operations :  {s['total_ops']:,}")
     print()
     print(f"  Request rate per {W} ms window")
