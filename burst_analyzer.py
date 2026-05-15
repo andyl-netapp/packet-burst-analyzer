@@ -89,10 +89,25 @@ def find_tshark() -> str | None:
     candidates = [
         r"C:\Program Files\Wireshark\tshark.exe",
         r"C:\Program Files (x86)\Wireshark\tshark.exe",
-        "tshark",
     ]
+
+    # Also try locating tshark via Windows 'where' or Unix 'which'
+    try:
+        where_cmd = "where" if sys.platform == "win32" else "which"
+        out = subprocess.run([where_cmd, "tshark"], capture_output=True,
+                             text=True, timeout=5)
+        for line in out.stdout.strip().splitlines():
+            line = line.strip()
+            if line and line not in candidates:
+                candidates.append(line)
+    except Exception:
+        pass
+
+    # Always try bare 'tshark' last (works if it's on PATH)
+    if "tshark" not in candidates:
+        candidates.append("tshark")
+
     for c in candidates:
-        # For full paths, check existence first to avoid subprocess overhead
         if c != "tshark" and not Path(c).exists():
             continue
         try:
@@ -743,7 +758,18 @@ def main() -> None:
 
     tshark = args.tshark or find_tshark()
     if not tshark:
-        sys.exit("ERROR: tshark not found. Install Wireshark or use --tshark PATH")
+        checked = [
+            r"C:\Program Files\Wireshark\tshark.exe",
+            r"C:\Program Files (x86)\Wireshark\tshark.exe",
+            "tshark (PATH)",
+        ]
+        print("ERROR: tshark not found. Checked:")
+        for p in checked:
+            print(f"  {p}")
+        print("\nFix options:")
+        print(r'  1. Add Wireshark to PATH: $env:PATH += ";C:\Program Files\Wireshark"')
+        print(r'  2. Use --tshark flag:     python burst_analyzer.py capture.pcap --tshark "C:\Program Files\Wireshark\tshark.exe"')
+        sys.exit(1)
     print(f"tshark: {tshark}")
 
     protocols = ["nfs", "smb2"] if args.protocol == "auto" else [args.protocol]
