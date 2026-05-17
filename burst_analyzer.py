@@ -261,6 +261,7 @@ def analyze(
     window_ms: int = 10,
     burst_sigma: float = 2.0,
     ops_filter: list[str] | None = None,
+    convoy_half: int = 50,
 ) -> dict | None:
     """
     Core burst analysis.
@@ -413,23 +414,33 @@ def analyze(
             entry["last_frame"]  = int(ops_in_win["frame_num"].max())
         top_windows.append(entry)
 
-    # Convoy context: peak window ± 10 windows, for the convoy effect chart
-    peak_win_idx = int(windows["req_count"].idxmax())
-    peak_win_num = int(windows.loc[peak_win_idx, "win"])
-    win_low  = max(windows["win"].min(), peak_win_num - 10)
-    win_high = min(windows["win"].max(), peak_win_num + 10)
-    convoy_windows = windows[(windows["win"] >= win_low) & (windows["win"] <= win_high)].copy()
-    # Add per-window p50 latency for convoy windows
-    convoy_lat = []
-    for _, cw in convoy_windows.iterrows():
-        ops_cw = df[df["win"] == cw["win"]]
-        convoy_lat.append({
-            "win_offset": int(cw["win"]) - peak_win_num,
-            "time_ms":    cw["time_ms"],
-            "req_count":  int(cw["req_count"]),
-            "p50_lat":    float(_percentile(ops_cw["latency_ms"], 50)) if not ops_cw.empty else float("nan"),
-            "p95_lat":    float(_percentile(ops_cw["latency_ms"], 95)) if not ops_cw.empty else float("nan"),
-            "latencies":  ops_cw["latency_ms"].dropna().tolist(),
+    # Convoy contexts for each Top 5 window — ±convoy_half windows each
+    def _build_convoy_context(center_win_num: int, half: int) -> list:
+        win_lo = max(windows["win"].min(), center_win_num - half)
+        win_hi = min(windows["win"].max(), center_win_num + half)
+        ctx = []
+        for _, cw in windows[(windows["win"] >= win_lo) & (windows["win"] <= win_hi)].iterrows():
+            ops_cw = df[df["win"] == cw["win"]]
+            ctx.append({
+                "win_offset": int(cw["win"]) - center_win_num,
+                "time_ms":    cw["time_ms"],
+                "req_count":  int(cw["req_count"]),
+                "p50_lat":    float(_percentile(ops_cw["latency_ms"], 50)) if not ops_cw.empty else float("nan"),
+                "p95_lat":    float(_percentile(ops_cw["latency_ms"], 95)) if not ops_cw.empty else float("nan"),
+                "latencies":  ops_cw["latency_ms"].dropna().tolist(),
+            })
+        return ctx
+
+    convoy_contexts = []
+    for rank, (_, row) in enumerate(top5_rows.iterrows(), start=1):
+        peak_win = int(row["win"])
+        convoy_contexts.append({
+            "rank":       rank,
+            "win_num":    peak_win,
+            "req_count":  int(row["req_count"]),
+            "start_s":    round(row["time_ms"] / 1000, 3),
+            "end_s":      round((row["time_ms"] + window_ms) / 1000, 3),
+            "context_windows": _build_convoy_context(peak_win, convoy_half),
         })
 
     return {
@@ -473,7 +484,7 @@ def analyze(
             "overall":      lat_stats(df["latency_ms"]),
         },
         "op_breakdown": df["op_name"].value_counts().to_dict(),
-        "convoy_context": convoy_lat,
+        "convoy_contexts": convoy_contexts,
     }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -619,87 +630,111 @@ def plot_analysis(result: dict, protocol: str, out_path: Path) -> None:
     print(f"  Chart → {out_path}")
 
 
-def plot_convoy(result: dict, window_ms: int, out_path: Path) -> None:
+def plot_convoy(ctx: dict, window_ms: int, out_path: Path) -> None:
     """
-    Convoy-effect chart: ±10 windows around the busiest window.
-    Top panel  — bar chart of op count per window.
-    Bottom panel — scatter of individual latencies + per-window p50 line.
+    Convoy-effect chart for one peak window (a single entry from convoy_contexts).
+
+    Top panel    — bar chart of op count per window.
+    Bottom panel — p50 and p95 latency lines; individual op dots shown only when
+                   the context is narrow enough (≤ 30 windows) to stay readable.
     """
-    convoy = result.get("convoy_context", [])
+    convoy = ctx.get("context_windows", [])
     if not convoy:
         return
 
-    offsets   = [c["win_offset"]  for c in convoy]
-    counts    = [c["req_count"]   for c in convoy]
-    p50s      = [c["p50_lat"]     for c in convoy]
-    times_ms  = [c["time_ms"]     for c in convoy]
-    peak_ms   = next((c["time_ms"] for c in convoy if c["win_offset"] == 0), None)
+    rank      = ctx.get("rank", "?")
+    peak_cnt  = ctx.get("req_count", 0)
+    peak_s    = ctx.get("start_s", 0)
+    peak_ms_t = next((c["time_ms"] for c in convoy if c["win_offset"] == 0), None)
 
-    # x-axis: ms offset from start of peak window
-    x_ms = [t - peak_ms for t in times_ms] if peak_ms is not None else [o * window_ms for o in offsets]
+    offsets  = [c["win_offset"] for c in convoy]
+    counts   = [c["req_count"]  for c in convoy]
+    p50s     = [c["p50_lat"]    for c in convoy]
+    p95s     = [c["p95_lat"]    for c in convoy]
+    times_ms = [c["time_ms"]    for c in convoy]
 
-    colors = ["#d62728" if o == 0 else "#ff7f0e" if abs(o) <= 3 else "#aec7e8"
+    x_ms = ([t - peak_ms_t for t in times_ms]
+            if peak_ms_t is not None
+            else [o * window_ms for o in offsets])
+
+    half      = max(abs(o) for o in offsets)
+    show_dots = len(convoy) <= 30
+
+    colors = ["#d62728" if o == 0 else "#ff7f0e" if abs(o) <= 5 else "#aec7e8"
               for o in offsets]
 
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 7), sharex=True,
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 7), sharex=True,
                                    gridspec_kw={"height_ratios": [2, 3]})
     fig.suptitle(
-        f"Convoy-Effect Context  (peak window ± {max(abs(o) for o in offsets)} × {window_ms} ms)",
-        fontsize=12, fontweight="bold"
+        f"Convoy-Effect Context  —  Rank #{rank} peak  "
+        f"({peak_cnt} ops @ {peak_s:.3f}s,  ±{half}×{window_ms}ms)",
+        fontsize=11, fontweight="bold"
     )
 
     # ── Panel 1: IO rate ─────────────────────────────────────────────────────
     bar_w = window_ms * 0.85
-    ax1.bar(x_ms, counts, width=bar_w, color=colors, edgecolor="white", linewidth=0.5)
+    ax1.bar(x_ms, counts, width=bar_w, color=colors, edgecolor="white", linewidth=0.3)
     ax1.set_ylabel(f"Ops / {window_ms} ms")
     ax1.set_title("① IO Rate")
     ax1.grid(True, alpha=0.3, axis="y")
-    for x, c in zip(x_ms, counts):
-        if c > 0:
-            ax1.text(x, c + max(counts) * 0.01, str(c), ha="center", va="bottom",
-                     fontsize=7, color="#333333")
+    ax1.axvline(x=0, color="#d62728", linestyle="--", linewidth=1.2, alpha=0.7)
+    if max(counts) > 0:
+        ax1.text(window_ms * 0.6, max(counts) * 0.92,
+                 "← peak", color="#d62728", fontsize=8)
+    # Label only windows with count > 0 when context is narrow
+    if show_dots:
+        for x, c in zip(x_ms, counts):
+            if c > 0:
+                ax1.text(x, c + max(counts) * 0.01, str(c), ha="center",
+                         va="bottom", fontsize=6.5, color="#333333")
 
-    # Annotate peak bar
-    peak_x = 0
-    ax1.axvline(x=peak_x, color="#d62728", linestyle="--", linewidth=1, alpha=0.6)
-    ax1.text(peak_x + window_ms * 0.5, max(counts) * 0.95,
-             "← peak", color="#d62728", fontsize=8)
+    # ── Panel 2: Latency ─────────────────────────────────────────────────────
+    if show_dots:
+        rng = np.random.default_rng(42)
+        for win_data, x_off in zip(convoy, x_ms):
+            lats = win_data["latencies"]
+            if not lats:
+                continue
+            jitter = rng.uniform(-window_ms * 0.3, window_ms * 0.3, size=len(lats))
+            c = ("#d62728" if win_data["win_offset"] == 0
+                 else "#ff7f0e" if abs(win_data["win_offset"]) <= 5
+                 else "#9ecae1")
+            ax2.scatter(x_off + jitter, lats, s=3, alpha=0.3, color=c, linewidths=0)
 
-    # ── Panel 2: Latency scatter + p50 line ──────────────────────────────────
-    rng = np.random.default_rng(42)
-    for win_data in convoy:
-        lats = win_data["latencies"]
-        if not lats:
-            continue
-        x_off = (win_data["time_ms"] - peak_ms) if peak_ms is not None else win_data["win_offset"] * window_ms
-        jitter = rng.uniform(-window_ms * 0.3, window_ms * 0.3, size=len(lats))
-        c = "#d62728" if win_data["win_offset"] == 0 else "#ff7f0e" if abs(win_data["win_offset"]) <= 3 else "#9ecae1"
-        ax2.scatter(x_off + jitter, lats, s=4, alpha=0.3, color=c, linewidths=0)
+    # p50 line
+    valid50 = [(x, p) for x, p in zip(x_ms, p50s) if not np.isnan(p)]
+    if valid50:
+        vx, vp = zip(*valid50)
+        ax2.plot(vx, vp, color="#1f77b4", linewidth=1.8, marker="o", markersize=3,
+                 label="p50", zorder=5)
 
-    # p50 line (skip NaN)
-    valid = [(x, p) for x, p in zip(x_ms, p50s) if not np.isnan(p)]
-    if valid:
-        vx, vp = zip(*valid)
-        ax2.plot(vx, vp, color="black", linewidth=1.8, marker="o", markersize=4,
-                 label="p50 latency", zorder=5)
-        ax2.legend(fontsize=8, loc="upper right")
+    # p95 line
+    valid95 = [(x, p) for x, p in zip(x_ms, p95s) if not np.isnan(p)]
+    if valid95:
+        vx, vp = zip(*valid95)
+        ax2.plot(vx, vp, color="#d62728", linewidth=1.4, marker="s", markersize=2.5,
+                 linestyle="--", label="p95", zorder=4)
 
-    ax2.axvline(x=peak_x, color="#d62728", linestyle="--", linewidth=1, alpha=0.6)
+    ax2.axvline(x=0, color="#d62728", linestyle="--", linewidth=1.2, alpha=0.7)
     ax2.set_xlabel(f"Time offset from peak window start (ms)")
     ax2.set_ylabel("Latency (ms)")
-    ax2.set_title("② Per-Op Latency  (dots = individual ops, line = p50)")
+    dot_note = "dots = individual ops,  " if show_dots else ""
+    ax2.set_title(f"② Per-Op Latency  ({dot_note}lines = p50 / p95)")
+    ax2.legend(fontsize=8, loc="upper right")
     ax2.grid(True, alpha=0.3)
 
-    # x-tick labels: show offset in ms
-    x_ticks = x_ms
-    x_labels = [f"{int(x):+d}" for x in x_ms]
-    ax2.set_xticks(x_ticks)
-    ax2.set_xticklabels(x_labels, fontsize=8)
+    # x-tick: thin out for wide contexts (show every 5th or 10th)
+    step = 1 if half <= 15 else 5 if half <= 50 else 10
+    sel = [(x, o) for x, o in zip(x_ms, offsets) if o % step == 0]
+    if sel:
+        tx, to = zip(*sel)
+        ax2.set_xticks(tx)
+        ax2.set_xticklabels([f"{int(v):+d}" for v in tx], fontsize=7)
 
     plt.tight_layout()
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close()
-    print(f"  Convoy chart → {out_path}")
+    print(f"  Convoy chart (rank #{rank}) → {out_path}")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Text report
@@ -916,6 +951,10 @@ def main() -> None:
                         help="Skip chart generation")
     parser.add_argument("--list-ops", action="store_true",
                         help="List all operation types found and exit")
+    parser.add_argument("--convoy-context", type=int, default=50, metavar="N",
+                        help="Half-width (in windows) of the convoy-effect context "
+                             "chart around each Top-5 peak (default: 50).  "
+                             "Use smaller values for narrower views.")
 
     args = parser.parse_args()
     args_sigma = args.sigma
@@ -979,7 +1018,8 @@ def main() -> None:
         result = analyze(ops_df,
                          window_ms=args.window,
                          burst_sigma=args.sigma,
-                         ops_filter=args.ops)
+                         ops_filter=args.ops,
+                         convoy_half=args.convoy_context)
         if result is None:
             print("  Analysis failed.")
             continue
@@ -993,11 +1033,12 @@ def main() -> None:
                 plot_analysis(result, proto, chart)
             except Exception as exc:
                 print(f"  WARNING: plot failed: {exc}")
-            try:
-                convoy_chart = out_dir / f"{pcap.stem}_{proto}_convoy.png"
-                plot_convoy(result, args.window, convoy_chart)
-            except Exception as exc:
-                print(f"  WARNING: convoy plot failed: {exc}")
+            for ctx in result.get("convoy_contexts", []):
+                try:
+                    convoy_chart = out_dir / f"{pcap.stem}_{proto}_convoy_rank{ctx['rank']}.png"
+                    plot_convoy(ctx, args.window, convoy_chart)
+                except Exception as exc:
+                    print(f"  WARNING: convoy plot (rank #{ctx.get('rank')}) failed: {exc}")
 
     if not all_results and not args.list_ops:
         sys.exit("No NFS or SMB2 traffic found in the capture file.")
