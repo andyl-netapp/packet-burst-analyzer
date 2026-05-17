@@ -57,6 +57,7 @@ SMB2_CMDS = {
 
 # tshark fields to extract for each protocol
 TSHARK_NFS_FIELDS = [
+    "frame.number",      # packet number in capture file
     "frame.time_epoch",
     "ip.src",
     "ip.dst",
@@ -69,6 +70,7 @@ TSHARK_NFS_FIELDS = [
 ]
 
 TSHARK_SMB2_FIELDS = [
+    "frame.number",      # packet number in capture file
     "frame.time_epoch",
     "ip.src",
     "ip.dst",
@@ -160,10 +162,10 @@ def extract_nfs(tshark: str, pcap: Path, client_ip: str | None = None) -> pd.Dat
         return pd.DataFrame()
 
     df = pd.read_csv(StringIO(out), sep="\t", low_memory=False)
-    df.columns = ["timestamp", "src", "dst", "msgtyp",
+    df.columns = ["frame_num", "timestamp", "src", "dst", "msgtyp",
                   "proc_v3", "proc_v4", "rpc_time", "xid", "nfs_count"]
 
-    for col in ["timestamp", "msgtyp", "proc_v3", "proc_v4", "rpc_time", "nfs_count"]:
+    for col in ["frame_num", "timestamp", "msgtyp", "proc_v3", "proc_v4", "rpc_time", "nfs_count"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
     # Resolve operation name (v3 takes precedence; fall back to v4)
@@ -182,11 +184,11 @@ def extract_smb2(tshark: str, pcap: Path, client_ip: str | None = None) -> pd.Da
         return pd.DataFrame()
 
     df = pd.read_csv(StringIO(out), sep="\t", low_memory=False)
-    df.columns = ["timestamp", "src", "dst", "is_response",
+    df.columns = ["frame_num", "timestamp", "src", "dst", "is_response",
                   "cmd", "smb2_time", "msg_id",
                   "smb2_read_bytes", "smb2_write_bytes"]
 
-    for col in ["timestamp", "is_response", "cmd", "smb2_time",
+    for col in ["frame_num", "timestamp", "is_response", "cmd", "smb2_time",
                 "smb2_read_bytes", "smb2_write_bytes"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
@@ -217,7 +219,7 @@ def build_ops_df(raw: pd.DataFrame, protocol: str) -> pd.DataFrame:
         replies["timestamp"]  = replies["timestamp"] - replies["rpc_time"]
         replies["latency_ms"] = replies["rpc_time"] * 1000
         replies["size_bytes"] = replies["nfs_count"]
-        return replies[["timestamp", "latency_ms", "op_name", "size_bytes"]].reset_index(drop=True)
+        return replies[["timestamp", "latency_ms", "op_name", "size_bytes", "frame_num"]].reset_index(drop=True)
 
     elif protocol == "smb2":
         responses = raw[raw["is_response"] == 1].dropna(subset=["smb2_time"]).copy()
@@ -227,7 +229,7 @@ def build_ops_df(raw: pd.DataFrame, protocol: str) -> pd.DataFrame:
         responses["latency_ms"] = responses["smb2_time"] * 1000
         # READ response carries smb2_read_bytes; WRITE response carries smb2_write_bytes
         responses["size_bytes"] = responses["smb2_read_bytes"].fillna(responses["smb2_write_bytes"])
-        return responses[["timestamp", "latency_ms", "op_name", "size_bytes"]].reset_index(drop=True)
+        return responses[["timestamp", "latency_ms", "op_name", "size_bytes", "frame_num"]].reset_index(drop=True)
 
     return pd.DataFrame()
 
@@ -392,12 +394,43 @@ def analyze(
     # Overall average latency across all ops (all op types combined)
     avg_latency_ms = round(float(df["latency_ms"].mean()), 3) if not df["latency_ms"].dropna().empty else None
 
-    # Top 5 busiest windows for the report table
-    top_windows = (
-        windows.nlargest(5, "req_count")
-        [["time_ms", "req_count", "p95_lat"]]
-        .to_dict("records")
-    )
+    # Top 5 busiest windows for the report table — include start/end times and frame range
+    has_frame_num = "frame_num" in df.columns
+    top5_rows = windows.nlargest(5, "req_count")
+    top_windows = []
+    for _, row in top5_rows.iterrows():
+        win_idx = row["win"]
+        ops_in_win = df[df["win"] == win_idx]
+        entry = {
+            "time_ms":   row["time_ms"],
+            "start_s":   round(row["time_ms"] / 1000, 3),
+            "end_s":     round((row["time_ms"] + window_ms) / 1000, 3),
+            "req_count": int(row["req_count"]),
+            "p95_lat":   row.get("p95_lat"),
+        }
+        if has_frame_num and not ops_in_win["frame_num"].isna().all():
+            entry["first_frame"] = int(ops_in_win["frame_num"].min())
+            entry["last_frame"]  = int(ops_in_win["frame_num"].max())
+        top_windows.append(entry)
+
+    # Convoy context: peak window ± 10 windows, for the convoy effect chart
+    peak_win_idx = int(windows["req_count"].idxmax())
+    peak_win_num = int(windows.loc[peak_win_idx, "win"])
+    win_low  = max(windows["win"].min(), peak_win_num - 10)
+    win_high = min(windows["win"].max(), peak_win_num + 10)
+    convoy_windows = windows[(windows["win"] >= win_low) & (windows["win"] <= win_high)].copy()
+    # Add per-window p50 latency for convoy windows
+    convoy_lat = []
+    for _, cw in convoy_windows.iterrows():
+        ops_cw = df[df["win"] == cw["win"]]
+        convoy_lat.append({
+            "win_offset": int(cw["win"]) - peak_win_num,
+            "time_ms":    cw["time_ms"],
+            "req_count":  int(cw["req_count"]),
+            "p50_lat":    float(_percentile(ops_cw["latency_ms"], 50)) if not ops_cw.empty else float("nan"),
+            "p95_lat":    float(_percentile(ops_cw["latency_ms"], 95)) if not ops_cw.empty else float("nan"),
+            "latencies":  ops_cw["latency_ms"].dropna().tolist(),
+        })
 
     return {
         "windows":     windows,
@@ -440,6 +473,7 @@ def analyze(
             "overall":      lat_stats(df["latency_ms"]),
         },
         "op_breakdown": df["op_name"].value_counts().to_dict(),
+        "convoy_context": convoy_lat,
     }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -584,6 +618,89 @@ def plot_analysis(result: dict, protocol: str, out_path: Path) -> None:
     plt.close()
     print(f"  Chart → {out_path}")
 
+
+def plot_convoy(result: dict, window_ms: int, out_path: Path) -> None:
+    """
+    Convoy-effect chart: ±10 windows around the busiest window.
+    Top panel  — bar chart of op count per window.
+    Bottom panel — scatter of individual latencies + per-window p50 line.
+    """
+    convoy = result.get("convoy_context", [])
+    if not convoy:
+        return
+
+    offsets   = [c["win_offset"]  for c in convoy]
+    counts    = [c["req_count"]   for c in convoy]
+    p50s      = [c["p50_lat"]     for c in convoy]
+    times_ms  = [c["time_ms"]     for c in convoy]
+    peak_ms   = next((c["time_ms"] for c in convoy if c["win_offset"] == 0), None)
+
+    # x-axis: ms offset from start of peak window
+    x_ms = [t - peak_ms for t in times_ms] if peak_ms is not None else [o * window_ms for o in offsets]
+
+    colors = ["#d62728" if o == 0 else "#ff7f0e" if abs(o) <= 3 else "#aec7e8"
+              for o in offsets]
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 7), sharex=True,
+                                   gridspec_kw={"height_ratios": [2, 3]})
+    fig.suptitle(
+        f"Convoy-Effect Context  (peak window ± {max(abs(o) for o in offsets)} × {window_ms} ms)",
+        fontsize=12, fontweight="bold"
+    )
+
+    # ── Panel 1: IO rate ─────────────────────────────────────────────────────
+    bar_w = window_ms * 0.85
+    ax1.bar(x_ms, counts, width=bar_w, color=colors, edgecolor="white", linewidth=0.5)
+    ax1.set_ylabel(f"Ops / {window_ms} ms")
+    ax1.set_title("① IO Rate")
+    ax1.grid(True, alpha=0.3, axis="y")
+    for x, c in zip(x_ms, counts):
+        if c > 0:
+            ax1.text(x, c + max(counts) * 0.01, str(c), ha="center", va="bottom",
+                     fontsize=7, color="#333333")
+
+    # Annotate peak bar
+    peak_x = 0
+    ax1.axvline(x=peak_x, color="#d62728", linestyle="--", linewidth=1, alpha=0.6)
+    ax1.text(peak_x + window_ms * 0.5, max(counts) * 0.95,
+             "← peak", color="#d62728", fontsize=8)
+
+    # ── Panel 2: Latency scatter + p50 line ──────────────────────────────────
+    rng = np.random.default_rng(42)
+    for win_data in convoy:
+        lats = win_data["latencies"]
+        if not lats:
+            continue
+        x_off = (win_data["time_ms"] - peak_ms) if peak_ms is not None else win_data["win_offset"] * window_ms
+        jitter = rng.uniform(-window_ms * 0.3, window_ms * 0.3, size=len(lats))
+        c = "#d62728" if win_data["win_offset"] == 0 else "#ff7f0e" if abs(win_data["win_offset"]) <= 3 else "#9ecae1"
+        ax2.scatter(x_off + jitter, lats, s=4, alpha=0.3, color=c, linewidths=0)
+
+    # p50 line (skip NaN)
+    valid = [(x, p) for x, p in zip(x_ms, p50s) if not np.isnan(p)]
+    if valid:
+        vx, vp = zip(*valid)
+        ax2.plot(vx, vp, color="black", linewidth=1.8, marker="o", markersize=4,
+                 label="p50 latency", zorder=5)
+        ax2.legend(fontsize=8, loc="upper right")
+
+    ax2.axvline(x=peak_x, color="#d62728", linestyle="--", linewidth=1, alpha=0.6)
+    ax2.set_xlabel(f"Time offset from peak window start (ms)")
+    ax2.set_ylabel("Latency (ms)")
+    ax2.set_title("② Per-Op Latency  (dots = individual ops, line = p50)")
+    ax2.grid(True, alpha=0.3)
+
+    # x-tick labels: show offset in ms
+    x_ticks = x_ms
+    x_labels = [f"{int(x):+d}" for x in x_ms]
+    ax2.set_xticks(x_ticks)
+    ax2.set_xticklabels(x_labels, fontsize=8)
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Convoy chart → {out_path}")
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Text report
 # ──────────────────────────────────────────────────────────────────────────────
@@ -710,14 +827,27 @@ def print_report(result: dict, protocol: str) -> None:
     # ── Section 2: Top burst windows (concrete evidence) ─────────────────────
     top = s.get("top_burst_windows", [])
     if top:
+        has_frames = "first_frame" in top[0]
         print(f"\n  Top {len(top)} busiest {W} ms windows")
-        print(f"  {'Time (s)':>10}   {'Ops':>6}   {'p95 lat (ms)':>14}")
-        print(f"  {'-'*10}   {'-'*6}   {'-'*14}")
+        if has_frames:
+            print(f"  {'Start (s)':>10}   {'End (s)':>9}   {'Ops':>5}   {'p95 lat':>10}   {'Frames (reply)':>14}")
+            print(f"  {'-'*10}   {'-'*9}   {'-'*5}   {'-'*10}   {'-'*14}")
+        else:
+            print(f"  {'Start (s)':>10}   {'End (s)':>9}   {'Ops':>5}   {'p95 lat':>10}")
+            print(f"  {'-'*10}   {'-'*9}   {'-'*5}   {'-'*10}")
         for w in top:
-            t_s   = w["time_ms"] / 1000
             p95   = w.get("p95_lat")
-            p95_s = f"{p95:>12.2f}" if p95 and not np.isnan(p95) else "          N/A"
-            print(f"  {t_s:>10.3f}   {w['req_count']:>6}   {p95_s}")
+            p95_s = f"{p95:>8.2f} ms" if p95 and not np.isnan(p95) else "       N/A"
+            base = (f"  {w['start_s']:>10.3f}   {w['end_s']:>9.3f}   "
+                    f"{w['req_count']:>5}   {p95_s}")
+            if has_frames:
+                frame_s = f"{w['first_frame']} – {w['last_frame']}"
+                print(f"{base}   {frame_s}")
+            else:
+                print(base)
+        if has_frames:
+            print(f"  (frame # = reply packet; corresponding request precedes each by ~latency ms)")
+        print(f"  ⚑  See convoy chart for ±10-window context around the peak window")
 
     # ── Section 3: Overall latency table ─────────────────────────────────────
     print(f"\n  LATENCY TABLE  (all operations)")
@@ -863,6 +993,11 @@ def main() -> None:
                 plot_analysis(result, proto, chart)
             except Exception as exc:
                 print(f"  WARNING: plot failed: {exc}")
+            try:
+                convoy_chart = out_dir / f"{pcap.stem}_{proto}_convoy.png"
+                plot_convoy(result, args.window, convoy_chart)
+            except Exception as exc:
+                print(f"  WARNING: convoy plot failed: {exc}")
 
     if not all_results and not args.list_ops:
         sys.exit("No NFS or SMB2 traffic found in the capture file.")
