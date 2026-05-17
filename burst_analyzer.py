@@ -261,7 +261,7 @@ def analyze(
     window_ms: int = 10,
     burst_sigma: float = 2.0,
     ops_filter: list[str] | None = None,
-    convoy_half: int = 50,
+    context_half: int = 50,
 ) -> dict | None:
     """
     Core burst analysis.
@@ -414,8 +414,8 @@ def analyze(
             entry["last_frame"]  = int(ops_in_win["frame_num"].max())
         top_windows.append(entry)
 
-    # Convoy contexts for each Top 5 window — ±convoy_half windows each
-    def _build_convoy_context(center_win_num: int, half: int) -> list:
+    # Peak-context windows for each Top 5 — ±context_half windows each
+    def _build_peak_context(center_win_num: int, half: int) -> list:
         win_lo = max(windows["win"].min(), center_win_num - half)
         win_hi = min(windows["win"].max(), center_win_num + half)
         ctx = []
@@ -430,16 +430,16 @@ def analyze(
             })
         return ctx
 
-    convoy_contexts = []
+    peak_contexts = []
     for rank, (_, row) in enumerate(top5_rows.iterrows(), start=1):
         peak_win = int(row["win"])
-        convoy_contexts.append({
+        peak_contexts.append({
             "rank":       rank,
             "win_num":    peak_win,
             "req_count":  int(row["req_count"]),
             "start_s":    round(row["time_ms"] / 1000, 3),
             "end_s":      round((row["time_ms"] + window_ms) / 1000, 3),
-            "context_windows": _build_convoy_context(peak_win, convoy_half),
+            "context_windows": _build_peak_context(peak_win, context_half),
         })
 
     return {
@@ -483,7 +483,7 @@ def analyze(
             "overall":      lat_stats(df["latency_ms"]),
         },
         "op_breakdown": df["op_name"].value_counts().to_dict(),
-        "convoy_contexts": convoy_contexts,
+        "peak_contexts": peak_contexts,
     }
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -629,9 +629,9 @@ def plot_analysis(result: dict, protocol: str, out_path: Path) -> None:
     print(f"  Chart → {out_path}")
 
 
-def plot_convoy(ctx: dict, window_ms: int, out_path: Path) -> None:
+def plot_peak_context(ctx: dict, window_ms: int, out_path: Path) -> None:
     """
-    Convoy-effect chart for one peak window (a single entry from convoy_contexts).
+    Peak-context chart for one busiest window (a single entry from peak_contexts).
 
     Top panel    — bar chart of op count per window.
     Bottom panel — average latency line; individual op dots shown only when
@@ -664,7 +664,7 @@ def plot_convoy(ctx: dict, window_ms: int, out_path: Path) -> None:
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 7), sharex=True,
                                    gridspec_kw={"height_ratios": [2, 3]})
     fig.suptitle(
-        f"Convoy-Effect Context  —  Rank #{rank} peak  "
+        f"Peak Window Context  —  Rank #{rank}  "
         f"({peak_cnt} ops @ {peak_s:.3f}s,  ±{half}×{window_ms}ms)",
         fontsize=11, fontweight="bold"
     )
@@ -725,7 +725,7 @@ def plot_convoy(ctx: dict, window_ms: int, out_path: Path) -> None:
     plt.tight_layout()
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close()
-    print(f"  Convoy chart (rank #{rank}) → {out_path}")
+    print(f"  Peak context chart (rank #{rank}) → {out_path}")
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Text report
@@ -873,7 +873,7 @@ def print_report(result: dict, protocol: str) -> None:
                 print(base)
         if has_frames:
             print(f"  (frame # = reply packet; corresponding request precedes each by ~latency ms)")
-        print(f"  ⚑  See convoy chart for ±10-window context around the peak window")
+        print(f"  ⚑  See peak context charts (*_peak_context_rank*.png) for ±{W}-window detail around each Top-5 peak")
 
     # ── Section 3: Overall latency table ─────────────────────────────────────
     print(f"\n  LATENCY TABLE  (all operations)")
@@ -942,10 +942,10 @@ def main() -> None:
                         help="Skip chart generation")
     parser.add_argument("--list-ops", action="store_true",
                         help="List all operation types found and exit")
-    parser.add_argument("--convoy-context", type=int, default=50, metavar="N",
-                        help="Half-width (in windows) of the convoy-effect context "
-                             "chart around each Top-5 peak (default: 50).  "
-                             "Use smaller values for narrower views.")
+    parser.add_argument("--context-windows", type=int, default=50, metavar="N",
+                        dest="context_windows",
+                        help="Half-width (in windows) of the peak context "
+                             "charts around each Top-5 busiest window (default: 50).")
 
     args = parser.parse_args()
     args_sigma = args.sigma
@@ -1010,7 +1010,7 @@ def main() -> None:
                          window_ms=args.window,
                          burst_sigma=args.sigma,
                          ops_filter=args.ops,
-                         convoy_half=args.convoy_context)
+                         context_half=args.context_windows)
         if result is None:
             print("  Analysis failed.")
             continue
@@ -1024,12 +1024,12 @@ def main() -> None:
                 plot_analysis(result, proto, chart)
             except Exception as exc:
                 print(f"  WARNING: plot failed: {exc}")
-            for ctx in result.get("convoy_contexts", []):
+            for ctx in result.get("peak_contexts", []):
                 try:
-                    convoy_chart = out_dir / f"{pcap.stem}_{proto}_convoy_rank{ctx['rank']}.png"
-                    plot_convoy(ctx, args.window, convoy_chart)
+                    ctx_chart = out_dir / f"{pcap.stem}_{proto}_peak_context_rank{ctx['rank']}.png"
+                    plot_peak_context(ctx, args.window, ctx_chart)
                 except Exception as exc:
-                    print(f"  WARNING: convoy plot (rank #{ctx.get('rank')}) failed: {exc}")
+                    print(f"  WARNING: peak context chart (rank #{ctx.get('rank')}) failed: {exc}")
 
     if not all_results and not args.list_ops:
         sys.exit("No NFS or SMB2 traffic found in the capture file.")
