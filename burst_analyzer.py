@@ -404,30 +404,37 @@ def analyze(
         "df":          df,
         "load_groups": load_groups,
         "summary": {
-            "duration_sec":         round(duration_sec, 3),
+            "duration_sec":              round(duration_sec, 3),
             # duration_sec = last_response_time − first_request_time
             # (excludes idle time at the beginning/end of the capture)
-            "total_ops":            int(len(df)),
-            "avg_latency_ms":       avg_latency_ms,
-            "avg_read_size_kb":     avg_read_size_kb,
-            "avg_write_size_kb":    avg_write_size_kb,
-            "window_ms":            window_ms,
-            "n_windows":            n_windows,
-            "mean_ops_per_window":  round(mean_c, 2),
-            "mean_ops_per_sec":     round(mean_c / window_sec, 1),
-            "peak_ops_per_window":  int(counts.max()),
-            "p90_ops_per_window":   round(p90_window, 1),
-            "p95_ops_per_window":   round(p95_window, 1),
-            "peak_to_mean_ratio":   round(peak_to_mean, 1),
-            "burst_threshold":      round(burst_threshold, 2),
-            "n_burst_windows":      int(windows["is_burst"].sum()),
-            "burst_pct":            round(float(windows["is_burst"].mean()) * 100, 1),
-            "top_burst_windows":    top_windows,
-            "cv":                   round(cv, 4),
-            "fano_factor":          round(fano, 4),
-            "burst_ratio":          round(burst_ratio, 4),
+            "total_ops":                 int(len(df)),
+            "avg_latency_ms":            avg_latency_ms,
+            "avg_read_size_kb":          avg_read_size_kb,
+            "avg_write_size_kb":         avg_write_size_kb,
+            "window_ms":                 window_ms,
+            "n_windows":                 n_windows,
+            "n_active_windows":          n_active,
+            "n_idle_windows":            n_windows - n_active,
+            "pct_idle_windows":          round((n_windows - n_active) / n_windows * 100, 1),
+            # mean over ALL windows (includes zeros) — used for burst threshold + CV/Fano
+            "mean_ops_per_window":       round(mean_c, 2),
+            "mean_ops_per_sec":          round(mean_c / window_sec, 1),
+            # mean over ACTIVE windows only — consistent with load_groups percentile bands
+            "mean_active_ops_per_window": round(float(active_wins["req_count"].mean()), 2) if n_active > 0 else 0.0,
+            "mean_active_ops_per_sec":   round(float(active_wins["req_count"].mean()) / window_sec, 1) if n_active > 0 else 0.0,
+            "peak_ops_per_window":       int(counts.max()),
+            "p90_ops_per_window":        round(p90_window, 1),
+            "p95_ops_per_window":        round(p95_window, 1),
+            "peak_to_mean_ratio":        round(peak_to_mean, 1),
+            "burst_threshold":           round(burst_threshold, 2),
+            "n_burst_windows":           int(windows["is_burst"].sum()),
+            "burst_pct":                 round(float(windows["is_burst"].mean()) * 100, 1),
+            "top_burst_windows":         top_windows,
+            "cv":                        round(cv, 4),
+            "fano_factor":               round(fano, 4),
+            "burst_ratio":               round(burst_ratio, 4),
             # Verdict thresholds: CV>1 or Fano>2 both indicate significant burstiness
-            "is_bursty":            cv > 1.0 or fano > 2.0,
+            "is_bursty":                 cv > 1.0 or fano > 2.0,
         },
         "latency": {
             "overall":      lat_stats(df["latency_ms"]),
@@ -619,11 +626,19 @@ def print_report(result: dict, protocol: str) -> None:
         print(f"  Avg op size      :  {parts}")
     print()
     print(f"  Request rate per {W} ms window")
-    print(f"    Average          :  {s['mean_ops_per_window']:.1f} ops  "
-          f"({s['mean_ops_per_sec']:.0f} ops/s)")
-    print(f"    Typical busy     :  {s['p90_ops_per_window']:.0f} ops  (90th-percentile window)")
+    n_idle   = s.get("n_idle_windows", 0)
+    n_tot    = s["n_windows"]
+    n_active = s.get("n_active_windows", n_tot)
+    pct_idle = s.get("pct_idle_windows", 0.0)
+    if n_idle > 0:
+        print(f"    Idle windows     :  {n_idle:,} of {n_tot:,} ({pct_idle:.0f}%) had zero ops")
+    print(f"    Average (all)    :  {s['mean_ops_per_window']:.1f} ops  "
+          f"({s['mean_ops_per_sec']:.0f} ops/s, averaged over all {n_tot:,} windows incl. idle)")
+    print(f"    Average (active) :  {s['mean_active_ops_per_window']:.1f} ops  "
+          f"({s['mean_active_ops_per_sec']:.0f} ops/s, over {n_active:,} windows with ops)")
+    print(f"    Typical busy     :  {s['p90_ops_per_window']:.0f} ops  (90th-percentile over all windows)")
     print(f"    Peak             :  {s['peak_ops_per_window']} ops  "
-          f"— {_ratio_tag(s['peak_to_mean_ratio'])} the average")
+          f"— {_ratio_tag(s['peak_to_mean_ratio'])} the all-window average")
     print()
 
     # Burst period count / fraction
@@ -637,8 +652,11 @@ def print_report(result: dict, protocol: str) -> None:
     lg = result.get("load_groups", {})
     if lg:
         print()
+        n_active_disp = s.get("n_active_windows", "?")
+        n_idle_disp   = s.get("n_idle_windows", 0)
         print(f"  Latency by load group  "
-              f"(windows ranked by ops/{W}ms)")
+              f"(percentile bands over {n_active_disp} active windows; "
+              f"{n_idle_disp} idle windows excluded)")
         print(f"  {'Group':<24}  {'Ops/'+str(W)+'ms':>10}  "
               f"{'p50':>10}  {'p95':>10}  {'p99':>10}")
         print(f"  {'-'*24}  {'-'*10}  {'-'*10}  {'-'*10}  {'-'*10}")
@@ -672,6 +690,12 @@ def print_report(result: dict, protocol: str) -> None:
             elif ratio >= 1.2:
                 print(f"  △  Heavy-load p95 is {ratio:.1f}× light-load p95 "
                       f"({q1_p95:.2f} ms → {q4_p95:.2f} ms)  — moderate impact.")
+            elif ratio <= 0.8:
+                print(f"  ℹ  Latency is LOWER under heavy load (p95: {q1_p95:.2f} ms → {q4_p95:.2f} ms).")
+                print(f"     This is unusual. Possible explanations:")
+                print(f"       • Server-side write coalescing / batching during sequential bursts")
+                print(f"       • Light-load windows contain slower op types (metadata, random reads)")
+                print(f"       • Verify op-type mix differs between light and heavy windows")
             else:
                 print(f"  ✓  Latency is stable across all load levels "
                       f"(p95: {q1_p95:.2f} ms → {q4_p95:.2f} ms).")
