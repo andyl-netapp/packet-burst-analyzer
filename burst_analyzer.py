@@ -425,8 +425,7 @@ def analyze(
                 "win_offset": int(cw["win"]) - center_win_num,
                 "time_ms":    cw["time_ms"],
                 "req_count":  int(cw["req_count"]),
-                "p50_lat":    float(_percentile(ops_cw["latency_ms"], 50)) if not ops_cw.empty else float("nan"),
-                "p95_lat":    float(_percentile(ops_cw["latency_ms"], 95)) if not ops_cw.empty else float("nan"),
+                "avg_lat":    float(ops_cw["latency_ms"].mean()) if not ops_cw.empty else float("nan"),
                 "latencies":  ops_cw["latency_ms"].dropna().tolist(),
             })
         return ctx
@@ -635,7 +634,7 @@ def plot_convoy(ctx: dict, window_ms: int, out_path: Path) -> None:
     Convoy-effect chart for one peak window (a single entry from convoy_contexts).
 
     Top panel    — bar chart of op count per window.
-    Bottom panel — p50 and p95 latency lines; individual op dots shown only when
+    Bottom panel — average latency line; individual op dots shown only when
                    the context is narrow enough (≤ 30 windows) to stay readable.
     """
     convoy = ctx.get("context_windows", [])
@@ -649,8 +648,7 @@ def plot_convoy(ctx: dict, window_ms: int, out_path: Path) -> None:
 
     offsets  = [c["win_offset"] for c in convoy]
     counts   = [c["req_count"]  for c in convoy]
-    p50s     = [c["p50_lat"]    for c in convoy]
-    p95s     = [c["p95_lat"]    for c in convoy]
+    avgs     = [c["avg_lat"]    for c in convoy]
     times_ms = [c["time_ms"]    for c in convoy]
 
     x_ms = ([t - peak_ms_t for t in times_ms]
@@ -688,7 +686,7 @@ def plot_convoy(ctx: dict, window_ms: int, out_path: Path) -> None:
                 ax1.text(x, c + max(counts) * 0.01, str(c), ha="center",
                          va="bottom", fontsize=6.5, color="#333333")
 
-    # ── Panel 2: Latency ─────────────────────────────────────────────────────
+    # ── Panel 2: Average latency ──────────────────────────────────────────────
     if show_dots:
         rng = np.random.default_rng(42)
         for win_data, x_off in zip(convoy, x_ms):
@@ -701,26 +699,19 @@ def plot_convoy(ctx: dict, window_ms: int, out_path: Path) -> None:
                  else "#9ecae1")
             ax2.scatter(x_off + jitter, lats, s=3, alpha=0.3, color=c, linewidths=0)
 
-    # p50 line
-    valid50 = [(x, p) for x, p in zip(x_ms, p50s) if not np.isnan(p)]
-    if valid50:
-        vx, vp = zip(*valid50)
-        ax2.plot(vx, vp, color="#1f77b4", linewidth=1.8, marker="o", markersize=3,
-                 label="p50", zorder=5)
-
-    # p95 line
-    valid95 = [(x, p) for x, p in zip(x_ms, p95s) if not np.isnan(p)]
-    if valid95:
-        vx, vp = zip(*valid95)
-        ax2.plot(vx, vp, color="#d62728", linewidth=1.4, marker="s", markersize=2.5,
-                 linestyle="--", label="p95", zorder=4)
+    # Average latency line
+    valid_avg = [(x, a) for x, a in zip(x_ms, avgs) if not np.isnan(a)]
+    if valid_avg:
+        vx, va = zip(*valid_avg)
+        ax2.plot(vx, va, color="#1f77b4", linewidth=2.0, marker="o", markersize=3,
+                 label="avg latency", zorder=5)
+        ax2.legend(fontsize=8, loc="upper right")
 
     ax2.axvline(x=0, color="#d62728", linestyle="--", linewidth=1.2, alpha=0.7)
     ax2.set_xlabel(f"Time offset from peak window start (ms)")
     ax2.set_ylabel("Latency (ms)")
     dot_note = "dots = individual ops,  " if show_dots else ""
-    ax2.set_title(f"② Per-Op Latency  ({dot_note}lines = p50 / p95)")
-    ax2.legend(fontsize=8, loc="upper right")
+    ax2.set_title(f"② Average Latency per Window  ({dot_note}line = mean)")
     ax2.grid(True, alpha=0.3)
 
     # x-tick: thin out for wide contexts (show every 5th or 10th)
