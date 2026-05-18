@@ -629,6 +629,91 @@ def plot_analysis(result: dict, protocol: str, out_path: Path) -> None:
     print(f"  Chart → {out_path}")
 
 
+def plot_summary(result: dict, protocol: str, out_path: Path) -> None:
+    """
+    Full-trace summary: dual-axis chart covering every window in the capture.
+      Left  Y-axis — ops per window (bars; burst windows highlighted red)
+      Right Y-axis — per-window average latency (orange line)
+    Top-5 peak windows are annotated with vertical dashed lines.
+    """
+    windows = result["windows"].sort_values("win").copy()
+    df      = result["df"]
+    s       = result["summary"]
+    W       = s["window_ms"]
+
+    # Per-window average latency from the ops DataFrame
+    avg_lat_map = df.groupby("win")["latency_ms"].mean()
+    windows["avg_lat"] = windows["win"].map(avg_lat_map)
+
+    t_s      = windows["time_ms"] / 1000
+    ops      = windows["req_count"]
+    avgs     = windows["avg_lat"]
+    is_burst = windows["is_burst"]
+    n_win    = len(windows)
+
+    fig, ax1 = plt.subplots(figsize=(16, 5))
+    ax2 = ax1.twinx()
+
+    # ── IO rate ───────────────────────────────────────────────────────────────
+    if n_win > 400:
+        # Too dense for individual bars — use filled area + burst overlay
+        ax1.fill_between(t_s, ops, alpha=0.45, color="#aec7e8", label=f"Ops / {W} ms")
+        ax1.fill_between(t_s, ops.where(is_burst, 0),
+                         alpha=0.75, color="#d62728", label="Burst windows")
+    else:
+        bar_w = (float(t_s.iloc[1]) - float(t_s.iloc[0])) * 0.85 if n_win > 1 else W / 1000 * 0.85
+        bar_colors = ["#d62728" if b else "#aec7e8" for b in is_burst]
+        ax1.bar(t_s, ops, width=bar_w, color=bar_colors, alpha=0.8, label=f"Ops / {W} ms")
+
+    # Burst threshold horizontal line
+    threshold = s.get("burst_threshold")
+    if threshold:
+        ax1.axhline(y=threshold, color="#d62728", linestyle=":", linewidth=1.0,
+                    alpha=0.6, label=f"Burst threshold ({threshold:.0f} ops)")
+
+    # ── Average latency ───────────────────────────────────────────────────────
+    valid = avgs.notna()
+    ax2.plot(t_s[valid], avgs[valid], color="#ff7f0e", linewidth=0.9,
+             alpha=0.85, label="Avg latency (ms)")
+
+    # ── Annotate Top-5 peaks ──────────────────────────────────────────────────
+    top5 = s.get("top_burst_windows", [])
+    ymax = ops.max() if ops.max() > 0 else 1
+    for w in top5:
+        rank = top5.index(w) + 1
+        x = w["start_s"]
+        ax1.axvline(x=x, color="#333333", linestyle="--", linewidth=0.9, alpha=0.55)
+        ax1.text(x, ymax * 0.97, f"#{rank}", ha="center", va="top",
+                 fontsize=7, color="#333333",
+                 bbox=dict(boxstyle="round,pad=0.15", fc="white", alpha=0.6, ec="none"))
+
+    # ── Labels & legend ───────────────────────────────────────────────────────
+    ax1.set_xlabel("Time (s)")
+    ax1.set_ylabel(f"Ops / {W} ms", color="#1f77b4")
+    ax2.set_ylabel("Avg latency (ms)", color="#ff7f0e")
+    ax1.tick_params(axis="y", labelcolor="#1f77b4")
+    ax2.tick_params(axis="y", labelcolor="#ff7f0e")
+
+    proto_u = protocol.upper()
+    n_ops   = s.get("total_ops", 0)
+    dur     = s.get("duration_sec", 0)
+    ax1.set_title(
+        f"{proto_u} — Full Trace Overview  "
+        f"({n_ops:,} ops over {dur:.1f}s,  {W}ms windows,  "
+        f"#1–5 = Top-5 busiest windows)",
+        fontsize=10
+    )
+
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, fontsize=8, loc="upper left")
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"  Summary chart → {out_path}")
+
+
 def plot_peak_context(ctx: dict, window_ms: int, out_path: Path) -> None:
     """
     Peak-context chart for one busiest window (a single entry from peak_contexts).
@@ -1024,6 +1109,11 @@ def main() -> None:
                 plot_analysis(result, proto, chart)
             except Exception as exc:
                 print(f"  WARNING: plot failed: {exc}")
+            try:
+                summary_chart = out_dir / f"{pcap.stem}_{proto}_summary.png"
+                plot_summary(result, proto, summary_chart)
+            except Exception as exc:
+                print(f"  WARNING: summary chart failed: {exc}")
             for ctx in result.get("peak_contexts", []):
                 try:
                     ctx_chart = out_dir / f"{pcap.stem}_{proto}_peak_context_rank{ctx['rank']}.png"
